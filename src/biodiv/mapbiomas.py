@@ -58,6 +58,22 @@ LEGEND_CSV = MB_DIR / "legend.csv"
 #: ``legend.csv`` is deliberately not moved: it names classes, it never builds the mask.
 RASTERS_DIR_ENV = "BIODIV_MAPBIOMAS_DIR"
 
+#: Where the rasters are when nothing says otherwise: the team prefix, read windowed over
+#: the network. The 3.6 GB of annual maps are **not** in the repo -- ``MapBiomas/`` holds
+#: only ``legend.csv`` and ``metadata.txt`` -- so a default pointing at it made every caller
+#: that did not set ``BIODIV_MAPBIOMAS_DIR`` fail with "no MapBiomas rasters in ...". The
+#: prefix is the one `scripts/argo/upload_assets.sh` uploads to and `process_argo.yaml`
+#: hands the pod, so pod, gateway worker and notebook now resolve the same rasters with no
+#: configuration. A local copy still wins over it, see ``rasters_dir``.
+#:
+#: This default is only affordable because the rasters are **COGs**: LZW-compressed, 512x512
+#: internal tiles, full overview pyramid (2 ... 516), so ``rasterio.open`` range-requests
+#: only the blocks a tile window touches, never the 144,896 x 34,599 px whole. Measured on
+#: this prefix: 0.79 s for a 10 km tile mask, 0.51 s for a 371 x 371 window. Replacing them
+#: with striped or uncompressed TIFFs would turn each of those into a ~150 MB download and
+#: this default into a mistake.
+DEFAULT_RASTERS_DIR = "s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/MapBiomas"
+
 #: Native vegetation. Forest (3 and its three subclasses), wetland, grassland, steppe,
 #: shrubland. Rocky outcrop (29) is a natural non-forest formation but is **not vegetation**
 #: and is excluded: only 1 of 1,082 plots falls on it, so including it would add an object the
@@ -81,8 +97,18 @@ def class_name(code: int) -> str:
 
 
 def rasters_dir() -> str:
-    """Local directory or ``s3://`` prefix holding the annual rasters."""
-    return os.environ.get(RASTERS_DIR_ENV) or str(MB_DIR)
+    """Local directory or ``s3://`` prefix holding the annual rasters.
+
+    In order: ``BIODIV_MAPBIOMAS_DIR`` if set (honoured as given -- an empty override is an
+    error to be reported, not something to silently fall back from), then a local
+    ``MapBiomas/`` that actually holds ``.tif`` files, then ``DEFAULT_RASTERS_DIR``. The
+    local check is on the rasters and not on the directory, which exists in every checkout
+    for ``legend.csv``.
+    """
+    env = os.environ.get(RASTERS_DIR_ENV)
+    if env:
+        return env
+    return str(MB_DIR) if any(MB_DIR.glob("*.tif")) else DEFAULT_RASTERS_DIR
 
 
 @lru_cache(maxsize=4)

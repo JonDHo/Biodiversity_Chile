@@ -52,6 +52,20 @@ def test_rasters_dir_follows_the_environment(tmp_path, monkeypatch):
     assert mb.year_map(2001)[0].endswith("2001_coverage_lclu_20-1-1_aaa.tif")
 
 
+def test_rasters_dir_defaults_to_s3_when_the_repo_has_no_rasters(tmp_path, monkeypatch):
+    """The repo ships `MapBiomas/legend.csv` and no rasters, so the directory existing is
+    not evidence the maps are there. Falling back to the team prefix is what lets `run_tile`
+    build a mask with nothing configured."""
+    monkeypatch.delenv(mb.RASTERS_DIR_ENV, raising=False)
+    monkeypatch.setattr(mb, "MB_DIR", tmp_path)
+    (tmp_path / "legend.csv").touch()
+    assert mb.rasters_dir() == mb.DEFAULT_RASTERS_DIR
+    assert mb.DEFAULT_RASTERS_DIR.startswith("s3://")
+
+    (tmp_path / "2010_coverage_x.tif").touch()      # a real local copy still wins
+    assert mb.rasters_dir() == str(tmp_path)
+
+
 def test_rasters_dir_scan_is_cached_per_directory(tmp_path, monkeypatch):
     """Two directories must not serve each other's listing: the cache is keyed, not global."""
     (tmp_path / "a").mkdir()

@@ -98,7 +98,7 @@ ckpts = sorted(assets.ckpt_dir().glob("model_seed*.pt"))
 ```bash
 # defaults point at the workflow's own prefix; credentials are all a reader needs
 export BIODIV_ASSETS=s3://<bucket>/<prefix>/assets
-export BIODIV_MAPBIOMAS_DIR=s3://<bucket>/<prefix>/MapBiomas
+export BIODIV_MAPBIOMAS_DIR=s3://<bucket>/<prefix>/MapBiomas   # optional, same default
 
 python scripts/73_map_inference.py --tiles-file <tiles.csv> --years 2000-2026 \
     --area-m2 900 --dest s3://<bucket>/<prefix>/maps --resume

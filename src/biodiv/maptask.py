@@ -11,8 +11,10 @@ WHAT A GATEWAY WORKER DOES NOT HAVE, and how each gap is closed (all four measur
 `logs/gw_probe.log`, on a real worker):
 
 * **the home directory** -- not mounted. The MapBiomas rasters are read from the scratch
-  bucket instead (`mapbiomas.RASTERS_DIR_ENV`), the checkpoints are shipped as bytes, and
-  the GeoTIFFs are written back to the scratch bucket rather than to `results/maps`.
+  bucket instead -- which is where `mapbiomas.rasters_dir` points by default, so no
+  configuration is needed and `RASTERS_DIR_ENV` is left for working against a copy -- the
+  checkpoints are shipped as bytes, and the GeoTIFFs are written back to the scratch bucket
+  rather than to `results/maps`.
 * **the `biodiv` package** -- not installed. The caller uploads it as a zip.
 * **torch** -- present, 2.12.0+cpu, and the whole worker image matches the pod version for
   version, which is what makes the scikit-learn 1.3.1 pickles inside the checkpoints safe

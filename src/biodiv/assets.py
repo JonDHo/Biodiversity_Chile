@@ -221,7 +221,7 @@ def describe() -> str:
         from . import mapbiomas as mb
         mb_dir = mb.rasters_dir()
     except ModuleNotFoundError:
-        mb_dir = os.environ.get("BIODIV_MAPBIOMAS_DIR") or "(unset: the repo's MapBiomas/)"
+        mb_dir = os.environ.get("BIODIV_MAPBIOMAS_DIR") or "(unset: the team prefix)"
     lines = [f"assets   : {assets_root()}"
              + ("" if os.environ.get(ASSETS_ENV) else "   (default: the workflow prefix)"),
              f"maps     : {maps_dest()}",

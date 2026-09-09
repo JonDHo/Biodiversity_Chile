@@ -172,8 +172,10 @@ def main() -> None:
                         "Defaults to --out/--tag. Gateway workers cannot see the home "
                         "directory, so a gateway run needs an s3:// prefix")
     p.add_argument("--mapbiomas-dir", default="", dest="mapbiomas_dir",
-                   help="directory or s3:// prefix holding the MapBiomas annual rasters, for "
-                        "workers that cannot see ./MapBiomas")
+                   help="directory or s3:// prefix holding the MapBiomas annual rasters. "
+                        "Only needed to work against a copy: the default is the team "
+                        "prefix, read windowed straight from S3, which pod and gateway "
+                        "worker reach alike")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--dry-run", action="store_true", dest="dry_run")
     p.add_argument("--out", default="results/maps")
