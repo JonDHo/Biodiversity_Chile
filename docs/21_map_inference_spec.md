@@ -136,6 +136,13 @@ píxel es solo una lectura de coherencia.
   escalador) es la que dice si eso importa.
 - `ck["rows"]` son las etiquetas de fila de la imagen serpentine, no las columnas de
   contexto; las columnas de contexto salen de `ck["ctx_preprocessor"].columns_`.
+- **`scripts/run_maps_supervised.sh` produciría mapas con el modelo viejo.** Sus líneas 29-30
+  siguen apuntando al 2D-CNN `C2D02_serpentine_...` mientras que el default de `scripts/73` y
+  `scripts/argo/upload_assets.sh` ya pasaron al C1D01 (§1, addendum). Además hace `cd
+  /home/jovyan/temp/Biodiversity_Chile`, que es otro checkout. Es el camino de dask-gateway,
+  hoy dormido frente a Argo, pero está vivo lo suficiente como para dispararse: **o se le
+  actualizan las rutas, o se le pone un encabezado diciendo que Argo lo reemplazó.** Sin
+  decidir a 2026-09-10.
 
 ---
 
@@ -410,10 +417,17 @@ en **toda** la tesela (la convención del cubo de parcelas, D6), así que `year_
 ese tramo sobre todos los píxeles, de la misma pasada de `isfinite` que produce `n_obs`.
 Enmascarar antes de eso movería la grilla en silencio.
 
-**El ahorro en tiempo depende de la tesela y no se puede presupuestar.** De las cuatro
-teselas medidas, tres son 96 % nativas (105.987 de 110.889 px) y ahí no ahorra casi nada;
-t18_529 predice 6.940 px/año y ahí ahorra ~94 %. Las teselas de §6 y §8.7 están en el medio
-(35-42 % de píxeles predichos). Nada de esto entra al presupuesto de §8.4.
+**El ahorro en tiempo escala con la fracción no nativa, y esa fracción varía muchísimo.** El
+primer conjunto de cuatro teselas medidas resultó 96 % nativo (105.987 de 110.889 px) y ahí no
+ahorra casi nada —salvo t18_529, que predice 6.940 px/año y ahorra ~94 %—, de donde salió la
+lectura inicial de que esto era sólo una corrección de memoria. El conjunto de siete teselas
+del barrido de §8.9 es **20 % nativo** (22.608 de 110.889 px) y está mucho más cerca de la
+mediana de producción, que anda entre 20 y 40 % (§6: 46.369 px/año; §8.7: 38.934). A 20 %
+nativo el reordenamiento saltea ~80 % de la interpolación, y eso sí es tiempo.
+
+La posición honesta es la intermedia: **el ahorro en tiempo es real en producción pero no se
+puede presupuestar por tesela**, y no entra al presupuesto de §8.4. Lo que sí es incondicional
+es la memoria.
 
 **Lo que sí es incondicional es la memoria, y esa es la razón del cambio:**
 
@@ -500,6 +514,50 @@ estrelló contra esta misma pared con la aritmética vieja (50 teselas / 5 chunk
 
 `parallelism` no se toca: un solo cambio por vez, para poder atribuir el resultado.
 
+#### Lo que eso vale para la corrida completa, y qué máquina conviene
+
+Proyección desde las siete teselas representativas del barrido (20 % nativas, mucho más cerca
+de la mediana de producción que las cuatro del primer conjunto): ~700 s de carga + 27 × 45 s
+≈ **1.915 s por tesela por proceso** ⇒ **~3.070 horas-proceso** para las 5.769 teselas.
+
+| concurrencia | tiempo de pared |
+|---|---:|
+| 7 (este pod) | ~18 días |
+| **30 (5 pods de Argo × `--jobs 6`)** | **~4,3 días** |
+| 64 (un m7i.16xlarge) | ~2,0 días |
+| 128 | ~1,0 día |
+
+Contra el `--jobs 1` de hoy —que son 5 pods × 1 proceso— el cambio de §8.9 **por sí solo**
+lleva la corrida de algo así como tres semanas a ~4 días, sin hardware nuevo.
+
+**Si se compra máquina, lo que decide es la RAM por vCPU**, no los núcleos: la forma eficiente
+es un proceso monohilo por vCPU (la carga escala con procesos, §8.10; los hilos de torch caen a
+63 % de eficiencia en 4, §8.6), así que los vCPU se llenan siempre y lo que puede faltar es
+memoria. Pico medido 1,24 GB por proceso en un tramo de 400 fechas; `obs` crece con las fechas,
+así que el tramo de producción son ~1,8 GB.
+
+| familia | GB/vCPU | veredicto a 10 km |
+|---|---:|---|
+| c7i | 2 | justo -- 1,8 GB de pico contra 2 GB de presupuesto, sin margen |
+| **m7i** | 4 | **2,2x de margen, recomendada** |
+| r7i | 8 | sólo si se pasa a teselas de 20 km (§8.11), y ni siquiera: ~3,9 GB/proceso |
+
+**Pero la estructura correcta sigue siendo muchos pods chicos, no una máquina grande**, y el
+argumento que decide no es de rendimiento sino de radio de daño. Esta corrida ya perdió 3.434
+teselas una vez y 3.320 otra, y los cinco chunks murieron juntos a los 63 minutos por
+expiración de token (§8.5): con un pod de 64 vCPU cualquiera de esos eventos cuesta todo lo que
+esté en vuelo, y con N pods chicos cuesta 1/N. A eso se suma que un pod grande necesita que
+exista un nodo grande —la sonda de capacidad registró un pedido de 6 × 16 núcleos que **nunca
+se agendó**, "pod larger than a node"— mientras que uno de 7 núcleos entra en el hueco que
+haya; que spot sólo es barato si la interrupción es barata; y que la reanudación ya funciona a
+esta granularidad (`tile_progress.py` deduplica por tesela contra S3). El costo de partir es
+chico: sincronizar los assets (~1 MB), el pull de imagen (cacheado en el nodo) y cargar el
+ensemble, uno o dos minutos contra chunks de horas.
+
+La máquina grande se vuelve razonable **recién cuando exista el cubo Zarr** (`docs/24`), porque
+ahí lo que manda es la localidad del dato y no la tolerancia a fallos: un nodo con copia local
+en SSD le gana a N pods que streamean de S3, y los reinicios dejan de ser caros.
+
 **Dos consecuencias de correr seis hijos en vez de uno**, ambas de corrección y no de
 rendimiento. `configure_s3_access` registra una config rio **por defecto** que no cruza a un
 subproceso, así que las variables de entorno de requester-pays (`AWS_REQUEST_PAYER`) dejan de
@@ -509,3 +567,171 @@ ser un cinturón redundante y pasan a ser la única cosa que sostiene el acceso 
 declaración explícita. Corolario documental: los rásters de MapBiomas **no** se copian al pod
 —son COGs leídos por ventana desde S3, 0,79 s la máscara de una tesela de 10 km—, así que
 copiar 3,6 GB a cada pod no compraría nada.
+
+### 8.10 El paralelismo que paga está a nivel de tesela, no de carga (medido 2026-09-10)
+
+Esta sección responde una pregunta que estaba abierta desde §8.1: si la carga se beneficia de
+procesos y no de hilos, ¿por qué no dejar que dask distribuya la carga como corresponde, con un
+`LocalCluster`, en vez del `scheduler="threads"` afinado a mano? La respuesta medida es que
+**sí, y aun así no conviene** — y el motivo por el que no conviene sólo se ve si se cronometra
+la tesela entera.
+
+#### Cuánto del pod está ocioso, y por qué
+
+Primero hay que medir bien: `ps pcpu` reporta el **promedio de vida del proceso**, no lo que
+está pasando ahora. Medido instantáneo, la carga usa una **mediana de 0,72 núcleos de 7 — el
+10 % del presupuesto de CPU del pod —** mientras sostiene 30 hilos. Con eso, la utilización de
+un pod a `--jobs 1`:
+
+| fase | share del tiempo de pared | CPU usada |
+|---|---:|---|
+| carga Landsat | ~45 % | ~0,7 de 7 núcleos (10 %) |
+| CNN (torch sin pinnear ⇒ 4 hilos) | ~55 % | ~4 de 7 núcleos (57 %) |
+| **promedio ponderado** | | **~36 %** |
+
+**Dos tercios de cada pod estaban ociosos.** Y explica el plateau de §8.1, que hasta ahora era
+sólo una curiosidad empírica: la carga está topada en ~1 núcleo porque GDAL sostiene el GIL, así
+que más *hilos* no pueden ayudar, pero más *procesos* traen cada uno su propio GIL y su propio
+~0,72 de núcleo.
+
+#### A/B de la carga sola: el cluster gana
+
+Una tesela, 570 fechas, 110.889 px, un proceso por arm, `taskset -c 0-6`, caché de teselas
+deshabilitada, y `threads=4` repetido al principio y al final como control de deriva:
+
+| arm | carga | RSS pico del driver |
+|---|---:|---:|
+| `threads=4` | 258,1 s | 1,20 GB |
+| `threads=8` | 240,2 s | 1,25 GB |
+| `cluster=4` | 177,2 s | 1,19 GB |
+| **`cluster=7`** | **107,9 s** | 1,20 GB |
+| `threads=4` (control) | 244,4 s | 1,20 GB |
+
+El control cerró a ±3 %, así que los arms son comparables. **El `LocalCluster` de procesos es
+2,3x más rápido que el scheduler de hilos que corre producción**, y `threads=8` le gana a
+`threads=4` apenas un 4 %: la perilla que todo el mundo estaba girando era casi plana. La
+objeción que se le hacía al camino del cluster —que `load_client=True` computa al driver y trae
+el arreglo entero de vuelta— **no se materializó**: el RSS del driver es idéntico en todos los
+arms. Ese era un problema del gateway (transferencia entre máquinas más anidamiento), no
+intrínseco.
+
+Salvedad: el arm `cluster=7` pidió 7 workers y reportó **5** registrados; tómese como "5-7
+workers", no como un dato limpio de 7.
+
+#### A/B de la tesela entera: el cluster pierde, y a 27 años pierde contra no hacer nada
+
+4 teselas repartidas en latitud, 5 años, carga + CNN + escritura, `taskset -c 0-6`:
+
+| arm | config | pared | carga mediana | año mediano | vs A |
+|---|---|---:|---:|---:|---:|
+| **A** | `--jobs 1 --workers 0 --load-threads 4` (Argo hoy) | 2.044 s | 185 s | 61,8 s | 1,00x |
+| **C** | `--workers 7 --jobs 1` | 1.581 s | 75 s | 73,8 s | 1,29x |
+| **B** | `--jobs 4 --load-threads 2` | **1.251 s** | 246 s | 170,2 s | **1,63x** |
+
+**`--jobs` gana, y hay que ver *cómo*:** todos los números por tesela de B son *peores* —carga
+246 s contra 185, año 170 s contra 62—, porque cada uno de los cuatro procesos recibe ~1,75
+núcleos y un solo hilo de torch. Gana puramente por concurrencia. Es el intercambio
+throughput-contra-latencia que §8.1 postulaba, ahora medido end to end.
+
+Y la columna del año delata el costo de C: **el trabajo por año sube 61,8 → 73,8 s (+19 %)**,
+porque los siete workers del cluster siguen vivos durante la fase de CNN y torch tiene menos
+máquina para sí. Proyectado a los 27 años de producción desde estas tasas por término:
+
+| arm | s/tesela proyectados a 27 años |
+|---|---:|
+| A | 185 + 27 × 61,8 = **1.854** |
+| B | (246 + 27 × 170,2) / 4 = **1.210** |
+| C | 75 + 27 × 73,8 = **2.068** |
+
+**C queda peor que A.** El `LocalCluster` gana la carga con claridad pero grava la CNN un 19 %,
+y a 27 años la CNN domina, así que el ahorro fijo de la carga no alcanza a pagarlo. Un
+benchmark de carga sola —que es exactamente lo que la pregunta original pedía, y donde C ganaba
+2,3x— **habría recomendado el cambio equivocado**.
+
+De ahí la formulación precisa, que es más fina que "procesos le ganan a hilos":
+
+> El paralelismo por procesos **a nivel de tesela** paga; **a nivel de carga** sale el tiro por
+> la culata.
+
+Salvedades: las cifras a 27 años son proyecciones desde tasas medidas por término, no
+mediciones; y estas cuatro teselas son 96 % nativas (~106k px/año), más densas que la mediana
+de producción, así que los tiempos por año absolutos son altos.
+
+#### Corolario: `--torch-threads` no es una preferencia de tuning
+
+**Nada dentro del contenedor revela el límite de 7 núcleos.** `cpu.max` lee `max` (la cuota se
+aplica en un cgroup padre, fuera de este namespace), y tanto `nproc` como la afinidad dicen 8.
+La memoria sí se ve. Así que torch no puede autodetectar: elige 4 por su heurística de núcleos
+físicos, que acá queda por debajo de 7 de casualidad. En un pod de Argo agendado a un nodo más
+grande —`logs/gw_probe.log` ya registró workers reportando 16 CPUs independientemente de lo
+pedido— elegiría 8 o más contra una cuota de 7 y se comería el throttling. **Pinnear los hilos
+de torch desde el YAML es la única forma que tiene el proceso de conocer su propio
+presupuesto**, no una elección de afinado.
+
+### 8.11 El tamaño de tesela ataca otra cosa, y se multiplica con `--jobs`
+
+`--jobs N` no reduce el trabajo: usa más núcleos y solapa la espera de S3 de una tesela con la
+CNN de otra. Las teselas más grandes **eliminan trabajo**: una escena Landsat son 180 × 180 km,
+así que una tesela de 20 km abre aproximadamente los *mismos* COGs que una de 10 km y saca 4x
+los píxeles. Como la carga es 96 % costo fijo de cabecera (§8.1), eso es una reducción real.
+Medido en `logs/load_scaling.log`, mismo número de hilos en todas las filas:
+
+| tesela | px | fechas | carga | por equivalente de 10 km |
+|---|---:|---:|---:|---:|
+| 5 km | 27.889 | 1.811 | 1.900,6 s | 7.602 s |
+| 10 km | 112.225 | 1.811 | 1.892,3 s | 1.892 s |
+| 20 km | 444.889 | 1.811 | 2.195,6 s | **549 s** |
+
+Ajuste: `carga = 1.846,9 s fijos + 765,4 s por Mpx`, 96 % fijo a 10 km. **4x el área por 16 %
+más carga: 3,45x menos carga por unidad de área.** Con la carga en ~47 % de una tesela de 27
+años, eso vale `0,47 / 3,45 + 0,53 = 0,67` ⇒ **~1,5x**, comparable a lo que compra `--jobs`. Y
+**los dos se multiplican en vez de solaparse**, porque uno recorta trabajo y el otro agrega
+núcleos.
+
+**Donde chocan es en la memoria, y ahí §8.8 es la precondición.** `obs` crece con el área: 0,80
+GB a 10 km, **3,21 GB a 20 km**, y el transitorio de la interpolación crece con él. Sin
+bloquear, `interp_common_grid` a 20 km pediría **~9,1 GiB por proceso**, así que `--jobs 6` a
+20 km sería directamente imposible; bloqueado son ~4,5 GB por hijo y seis entran en 27 GB.
+
+Dos conexiones más:
+
+- Las teselas grandes capturan más área no nativa (+10 % a 20 km), lo que **baja** la fracción
+  nativa media — así que el reordenamiento de §8.8 paga *más* a 20 km. Los dos cambios se
+  refuerzan.
+- **19,98 km = 2 × 9.990 m encaja exacto** en el retículo de D7, así que la lista de teselas
+  gruesas se deriva de `tiles_native_10km.csv` por división entera, sin volver a escanear
+  MapBiomas.
+
+Salvedades antes de usarlo: el ajuste está medido sólo hasta 20 km, así que 30 km extrapola y
+necesitaría una carga real para confirmarse; y una tesela de 20 km a 27 años corre ~4.600 s en
+serie, lo que interactúa con `chunk-deadline-seconds: 7200` — ese presupuesto hay que
+recalcularlo antes de cambiar (§8.9).
+
+### 8.12 Lo que se midió y **no** es el cuello de botella (2026-09-10)
+
+Registrado para que nadie vuelva a intentarlo.
+
+**El índice ODC compartido no limita el escalado.** Era la sospecha obvia contra crecer en
+concurrencia —es Postgres, y es infraestructura compartida con el resto del despliegue—. Sondeado
+con 1/2/4/7/14 procesos concurrentes, cada uno corriendo las cuatro consultas de índice que
+necesita una tesela de tramo completo:
+
+| concurrencia | consultas | mediana | p90 | throughput |
+|---:|---:|---:|---:|---:|
+| 1 | 4 | 4,03 s | 5,00 s | 0,20 q/s |
+| 2 | 8 | 2,49 s | 3,21 s | 0,49 q/s |
+| 4 | 16 | 2,24 s | 5,49 s | 0,65 q/s |
+| 7 | 28 | 3,01 s | 8,00 s | 0,80 q/s |
+| 14 | 56 | 5,89 s | 8,41 s | 1,02 q/s |
+
+El índice **sí** satura —3,5x más concurrencia de 4 a 14 compra sólo 1,57x de throughput y el
+p90 casi se duplica— pero satura **muy por encima** de lo que este trabajo le pide. Una tesela
+emite 4 consultas y después se calla ~2.200 s haciendo I/O y CNN, así que incluso a 128 procesos
+concurrentes la tasa *media* es 128 × 4 / 2.244 ≈ **0,23 q/s**, cómodamente dentro del ~1 q/s
+que sostuvo a concurrencia 14. Por tesela el índice son ~24 s de ~2.244, cerca del **1 %**. Las
+consultas llegan como ráfagas breves en los bordes de tesela, no como carga sostenida.
+
+**`torch.compile` es 4x más lento**, no más rápido: recompila por cada forma de batch.
+
+**El tamaño de batch es indiferente**: 3,12 / 3,01 / 3,12 s. No hay nada que ganar ahí en CPU
+(en GPU la historia cambia, ver `docs/24` §6).

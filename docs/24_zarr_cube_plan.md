@@ -47,11 +47,15 @@ demás. Cuatro consecuencias, en el orden que importa:
    serlo sobre tres cuartos. Por eso la caché va primero y la GPU después: al revés compra
    mucho menos.
 
-**Dimensionamiento (estimación, la Fase 0 lo mide).** 5.769 teselas × 110.889 px × ~1.811
-fechas × 4 B float32 ≈ **4,6 TB** en crudo. El arreglo es mayoritariamente NaN —la fracción
-exacta es una de las cosas que hay que medir, no suponer— así que con zstd el orden esperado
-es de **~1 TB**, pero ese número no está verificado y el plan no debe apoyarse en él hasta
-que la Fase 0 lo confirme.
+**Dimensionamiento (estimación, la Fase 0 lo mide).** Por tesela: 110.889 px × ~1.650 fechas ×
+4 B ≈ **732 MB** en crudo, quizá **~180 MB** comprimido. Para las 5.769 teselas eso da **~4,2 TB**
+crudo (~4,6 TB si se toma el conteo de 1.811 fechas de §6 en vez de 1.650 — la Fase 0 fija
+cuál corresponde) y del orden de **~1 TB** comprimido. El arreglo es mayoritariamente NaN, pero
+**la fracción exacta hay que medirla, no suponerla**, y el plan no debe apoyarse en el ~1 TB
+hasta que la Fase 0 lo confirme.
+
+Vale notar que el cubo es **más chico que lo que se transfiere hoy**: el camino actual trae
+`red` + `nir` + `qa_pixel` como uint16 (~6 B/px/fecha) para derivar un kNDVI de 4 B.
 
 ## 3. Fase 0 — consistencia a pequeña escala, antes de cualquier decisión de escalado
 
@@ -89,10 +93,48 @@ hilos —que es lo que confirma o refuta el punto 3 de §2—.
 Si la igualdad bit a bit no se alcanza, la decisión que sigue es **declarar una tolerancia o
 abandonar**, y esa es del autor, no del código.
 
-**Nota de diseño, ya decidida:** el chunking va a lo largo de todo el eje temporal con bloques
-espaciales modestos, porque el patrón de acceso es "toda la serie de tiempo de una región
-espacial". Y **no** se guardan curvas pre-computadas en vez de kNDVI: hornean la interpolación
-y la convención de ventana (D6) dentro del producto, y no ocupan menos.
+**Notas de diseño, ya decididas.** El chunking va a lo largo de todo el eje temporal con
+bloques espaciales modestos, porque el patrón de acceso es "toda la serie de tiempo de una
+región espacial". Y **no** se guardan curvas pre-computadas en vez de kNDVI: hornean la
+interpolación y la convención de ventana (D6) dentro del producto, y no ocupan menos.
+
+Tres trampas más, todas de forma y no de tamaño:
+
+- **Alineación de chunks, que es lo que decide si streamear de S3 sirve.** Si los chunks no
+  caen sobre el retículo de teselas de D7, hay amplificación de lectura: una tesela de 333 px
+  que cruza chunks de 256 px trae ~2x lo que usa. Chunkeando espacialmente contra la grilla de
+  9.990 m / 333 px, cada tesela lee exactamente sus propios chunks. Si esto sale mal, streamear
+  se ve pésimo por razones que no tienen nada que ver con S3.
+- **Cantidad de objetos.** Chunks de ~10 MB para arriba. Algo como `(1, 256, 256)` produciría
+  millones de objetos diminutos, que en Zarr v2 sobre S3 es doloroso de listar y leer (el
+  sharding de Zarr v3 lo resuelve; más simple es no meterse). Time completo × tamaño de tesela
+  da objetos de ~180 MB, uno por tesela.
+- **Dispersión: un store por tesela, no un array gigante.** Sólo 5.769 de 17.019 teselas tienen
+  vegetación nativa; un array denso sobre la extensión completa sería ~3x más grande con dos
+  tercios vacío. Un Zarr por tesela evita la coordinación de escrituras por región, no
+  desperdicia espacio, es trivialmente paralelo, y la reanudación es "¿existe el store de esta
+  tesela?" — la misma lógica que ya usa `tile_progress.py`. Se pierde la elegancia del dataset
+  único, pero calza con el patrón de acceso, porque la inferencia lee una tesela por vez.
+
+**¿Se puede escribir un Zarr de este tamaño, y con qué máquina?** Sí, cómodamente, y es más
+fácil de lo que suena porque **la escritura es en streaming y vergonzosamente paralela**: nunca
+se sostiene el arreglo en memoria, cada worker escribe sus chunks y los olvida. El costo está
+dominado por el lado de la *lectura*, que es la misma carga de COGs que ya se hace:
+
+| | |
+|---|---|
+| por worker | ~732 MB de la tesela + ~2 GB de transitorio de carga ≈ **~3 GB** — igual que hoy, así que aplica la misma regla de 4 GB/vCPU de `docs/21` §8.9 |
+| trabajo total | 5.769 × ~825 s ≈ **~1.322 horas-proceso** |
+| en un m7i.16xlarge (64 vCPU) | ~21 h; dos nodos, ~10 h; en los 5 pods de Argo a `--jobs 6`, ~2 días |
+| ancho de banda de escritura | 1 TB en 21 h ≈ **~14 MB/s agregados**. El PUT de S3 no es un problema |
+
+**Y la jugada que probablemente conviene: no construirlo como un job aparte.** La próxima
+corrida de producción ya carga cada tesela exactamente una vez. Un flag `--write-cube` en
+`scripts/73` que escriba el Zarr como efecto secundario hace que construirlo no cueste
+prácticamente nada más que el ancho de banda de escritura, entrega los mapas *y* el cubo en una
+sola pasada, y deja todas las corridas siguientes en el camino rápido. Eso convierte un job de
+21 horas en un flag. **Se decide después de la Fase 0**, no antes: si la igualdad bit a bit no
+se alcanza, este atajo escribiría 1 TB de algo que no sirve.
 
 ## 4. La tensión de diseño: el cluster de dask estorba al procesamiento
 
@@ -106,11 +148,16 @@ distintas**, y no un poco distintas:
 | paralelismo que paga | procesos, no hilos (6,2x contra 3,4x, §8.1) | hilos de torch hasta ~2 (89 % de eficiencia, §8.6) |
 | dask | ayuda | **estorba** |
 
-Esa última fila es el punto. Un cluster de dask dimensionado para saturar la lectura deja sus
-workers ociosos durante la inferencia —es exactamente la patología de §6 y §8.2, por la que el
-gateway recibe la tesela entera y no la carga—. Materializar el cubo **separa** las dos fases y
-por eso permite, por primera vez, darle a cada una la forma que quiere. Las tres opciones de
-abajo se diferencian en *dónde* se pone ese corte.
+Esa última fila **está medida, no supuesta** (`docs/21` §8.10). Un `LocalCluster` de procesos
+gana la carga con claridad —2,3x contra el scheduler de hilos— y aun así pierde la tesela: sus
+workers siguen vivos durante la CNN y le suben el trabajo por año un 19 %, de modo que
+proyectado a 27 años queda **peor que no hacer nada**. Es la misma patología de §6 y §8.2, por
+la que el gateway recibe la tesela entera y no la carga, ahora con número.
+
+Materializar el cubo **separa** las dos fases, y por eso permite por primera vez darle a cada
+una la forma que quiere: la fase de construcción es justamente aquella donde el cluster de dask
+sí gana, porque ahí no hay CNN detrás a la que gravar. Las tres opciones de abajo se diferencian
+en *dónde* se pone ese corte.
 
 ## 5. Opciones de escalado
 
@@ -160,6 +207,28 @@ análisis.
   cuota permanente, la ruta de cluster topa cerca de 40 núcleos y Argo gana por default; si
   fue capacidad transitoria, dask-on-spot es probablemente el camino más barato.
 
+### Lo que ya se descartó como restricción
+
+**El índice ODC compartido no es el techo.** Era la objeción obvia a subir la concurrencia, y
+se midió: satura, pero muy por encima de lo que este trabajo le pide — ~1 % del tiempo de una
+tesela, ~0,23 q/s medios incluso a 128 procesos. El detalle está en `docs/21` §8.12. **No hace
+falta sondearlo de nuevo antes de elegir opción**, y no limita el tamaño de nodo.
+
+**El SSD local es una optimización, no un requisito.** Streamear el Zarr desde S3 alcanza: lo
+que hace lenta la carga de hoy es el *número de requests y la latencia*, no los bytes —~5.970
+aperturas de COG, 96 % costo fijo—, y el Zarr colapsa eso a unos pocos chunks por tesela, lo que
+mueve el cuello de latencia a ancho de banda, que es donde S3 es bueno. En una sola pasada cada
+tesela se lee exactamente una vez, así que bajar a SSD primero significa leer el TB **dos**
+veces. El SSD paga cuando hay re-lecturas: re-corridas, reinicios, experimentación de
+parámetros — que, dado el historial de reinicios de §8.5, puede muy bien ser el caso, pero es
+cinturón y tiradores, no la base del diseño.
+
+**Un beneficio adicional que sólo aparece con el cubo materializado:** deja de hacer falta
+cargar el tramo completo por adelantado. Leer sólo la ventana de 3 años de cada objetivo se
+vuelve barato, porque no hay penalidad de "reabrir los COGs" — y eso colapsa la huella de `obs`
+que hoy manda en el dimensionamiento de RAM por vCPU (`docs/21` §8.9), lo que a su vez hace
+mucho más fácil pasar a teselas de 20 km (`docs/21` §8.11).
+
 ### Cómo elegir
 
 No hace falta decidir ahora, y no conviene: la Fase 0 produce el número que separa A de B
@@ -184,15 +253,37 @@ mantener la GPU alimentada.
 entre CPU y GPU, así que la diferencia de rásters de §8.8 no va a dar cero y necesita una
 **tolerancia declarada** en vez de igualdad. Conviene fijarla antes de mirar el resultado.
 
+**La regla de decisión, para no comprar por entusiasmo.** Hoy, con la carga en ~47 % de la
+tesela, Amdahl topa la GPU en **~1,7x** por tesela: acelera lo que no es el cuello. La forma
+útil de plantearlo es que una GPU no sólo hace rápida la CNN, sino que **libera a las CPU de
+hacerla**, así que el mismo número de vCPU carga ~2,1x más teselas por hora. De ahí:
+
+> Una instancia con GPU conviene sólo si cuesta menos que **~2x** una instancia CPU con el
+> mismo número de vCPU.
+
+A precios EC2 de hoy eso suele quedar cerca del empate, así que hay que **cotizarlo en el
+momento de decidir**, no asumirlo. Lo que cambia el cálculo es exactamente lo de §2 punto 4:
+con la carga materializada el forward pasa a ~77 % de la tesela y la GPU deja de ser 1,7x para
+ser una palanca de 5x o más. Por eso el orden importa.
+
+Cuándo una GPU sí sería una decisión fácil para este tipo de procesamiento, para tenerlo de
+referencia: un modelo materialmente más grande (un transformer, una U-Net sobre parches, o
+muchos más miembros de ensemble), o trabajo por píxel pesado en vez de diminuto (ajuste denso
+de series, kernels grandes, solvers iterativos). Nada de eso describe al modelo actual.
+
 ## 7. Secuencia
 
-1. **Fase 0**, una tesela: consistencia bit a bit + fracción de NaN + tamaño + escalado de
-   lectura por hilos. Compuerta.
-2. **Sonda de capacidad**: ¿los ~5 workers son cuota o fueron circunstancia?
-3. **Elegir A, B o C** con (1) y (2) en la mano.
-4. **Prueba de GPU** sobre una tesela cacheada, con tolerancia declarada. Independiente de
-   (1)-(3); se puede correr en paralelo.
-5. Construir.
+1. **Fase 0**, una tesela: consistencia bit a bit + fracción de NaN + tamaño comprimido +
+   escalado de lectura por hilos + alineación de chunks. Compuerta: nada sigue si falla.
+2. **Decidir `--write-cube`**: si la Fase 0 pasa, la próxima corrida de producción puede
+   construir el cubo de paso y volver innecesaria la elección de (3). Es la decisión más barata
+   de todo el plan y por eso va antes que la sonda.
+3. **Sonda de capacidad**: ¿los ~5 workers son cuota o fueron circunstancia? Sólo hace falta si
+   (2) sale que no.
+4. **Elegir A, B o C** con (1) y (3) en la mano.
+5. **Prueba de GPU** sobre una tesela cacheada, con tolerancia declarada y la regla de costo de
+   §6. Independiente de (1)-(4); se puede correr en paralelo.
+6. Construir.
 
 ## Referencias
 
@@ -200,5 +291,8 @@ entre CPU y GPU, así que la diferencia de rásters de §8.8 no va a dar cero y 
   entera), §8.4 (presupuesto), §8.5 (la corrida se detiene sola), §8.6 (1D-CNN y escalado de
   hilos de torch), §8.7 (tabla de smearing), §8.8 (memoria de la interpolación y
   `BIODIV_TILE_CACHE`), §8.9 (`--jobs 6`).
+- `docs/21` §8.10 (por qué el cluster de dask gana la carga y pierde la tesela), §8.11 (el
+  tamaño de tesela, que el cubo vuelve mucho más accesible), §8.12 (el índice ODC no es el
+  techo).
 - `scripts/argo/tile_progress.py` — el patrón de idempotencia contra S3 que las opciones A y C
   reutilizan.
