@@ -31,10 +31,19 @@
 #     raises it linearly. If it starts to matter, restrict git-sync with
 #     --sparse-checkout-file rather than reviving the mirror.
 #
-# The private inputs the run needs (model checkpoints, OOF predictions,
-# derived parquet, the tile list, the MapBiomas rasters) are NOT in git --
-# they are staged into the pod from S3 by an initContainer. One-time upload:
-# scripts/argo/upload_assets.sh.
+# The private inputs the run needs are NOT in git, and they arrive three
+# different ways -- the distinction matters, because two of them are not
+# copied into the pod at all:
+#   - checkpoints, OOF predictions and the derived parquet are synced into
+#     /work/assets by the stage-assets initContainer;
+#   - the tile list is fetched and split by list-missing / split-tiles into
+#     /work/chunks, not by that initContainer;
+#   - the MapBiomas rasters are NOT staged. Copying 3.6 GB into every pod
+#     would buy nothing: they are COGs and are read windowed straight from S3
+#     (measured 0.79 s for one 10 km tile's mask). That prefix is also what
+#     src/biodiv/mapbiomas.rasters_dir defaults to now, so --mapbiomas-dir
+#     below is an explicit declaration, not a requirement.
+# One-time upload: scripts/argo/upload_assets.sh.
 #
 # ---------------------------------------------------------------------
 # Credentials and data -- taken from the verified scripts/argo/test-s3-access.yaml
@@ -419,11 +428,12 @@ spec:
         value: _raw100
       # usgs-landsat is requester-pays. scripts/73 already calls
       # configure_s3_access(aws_unsigned=False, requester_pays=True) before
-      # building the Datacube, and with --jobs 1 --workers 0 that runs in this
-      # very process -- but it only registers a DEFAULT rio config, which
-      # datacube activates per thread and which does not override a
-      # rasterio.Env already active on that thread. GDAL reads these from the
-      # environment directly, so setting them here holds on every thread.
+      # building the Datacube -- under --jobs 6 that happens in each of the
+      # six child processes, which inherit this environment -- but it only
+      # registers a DEFAULT rio config, which datacube activates per thread
+      # and which does not override a rasterio.Env already active on that
+      # thread. GDAL reads these from the environment directly, so setting
+      # them here holds on every thread of every child.
       - name: AWS_REQUEST_PAYER
         value: requester
       - name: AWS_DEFAULT_REGION
