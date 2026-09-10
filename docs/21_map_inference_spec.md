@@ -393,3 +393,119 @@ contra el error, que sobra en todo el rango: construir cuesta una pasada de los 
 sobre M filas, así que un M cercano al número de píxeles de una tesela hace que la tabla
 cueste tanto como el año que reemplaza —a 65.536 una tesela de un año midió 0,87x, más lenta
 que el camino exacto.
+
+### 8.8 La interpolación pagaba por toda la tesela, y pedía 2,3 GiB (medido y corregido 2026-09-10)
+
+`run_tile` interpolaba los 110.889 píxeles de la tesela y *después* descartaba los que la
+máscara de MapBiomas deja fuera. El reordenamiento —máscara y ventana antes de interpolar—
+se apoya en una identidad que queda verificada en un test:
+
+> `np.isfinite(curves).all(axis=1)` es **exactamente** `n_obs >= MIN_OBS`. Una curva vuelve
+> NaN sólo si el píxel no tuvo ninguna observación despejada, y entonces lo es en todos los
+> puntos de la grilla, nunca en algunos.
+
+Así que qué píxeles vale la pena correr se sabe **antes** de interpolar. Lo que no se puede
+diferir es `lo`/`hi`: la grilla abarca la primera y la última fecha con algún píxel despejado
+en **toda** la tesela (la convención del cubo de parcelas, D6), así que `year_window` calcula
+ese tramo sobre todos los píxeles, de la misma pasada de `isfinite` que produce `n_obs`.
+Enmascarar antes de eso movería la grilla en silencio.
+
+**El ahorro en tiempo depende de la tesela y no se puede presupuestar.** De las cuatro
+teselas medidas, tres son 96 % nativas (105.987 de 110.889 px) y ahí no ahorra casi nada;
+t18_529 predice 6.940 px/año y ahí ahorra ~94 %. Las teselas de §6 y §8.7 están en el medio
+(35-42 % de píxeles predichos). Nada de esto entra al presupuesto de §8.4.
+
+**Lo que sí es incondicional es la memoria, y esa es la razón del cambio:**
+
+| | pico RSS del camino de tesela, 10 km |
+|---|---:|
+| antes | 2.345 MiB |
+| después | **294 MiB** |
+
+Tres cambios, ninguno aproximado: índices `int32` en vez de los `int64` que numpy elegiría
+—son números de fila en una ventana de unos cientos de fechas, y los cuatro arreglos `(T, N)`
+eran 0,93 GB del pico—, `np.copyto(..., where=)` en vez de cinco `np.where` encadenados que
+alocaban un `(G, N)` float64 nuevo por rama, y un parámetro `block` que interpola por bloques
+de columnas (`TileConfig.interp_block`, 20.000 por defecto). El transitorio de
+`interp_common_grid` es ~20x su propia entrada, y es lo que acota cuántas teselas caben en un
+pod.
+
+Las dos consecuencias operativas: `--jobs 6/7` entra en los 30 GiB del pod (§8.9), y las
+teselas de 20 km dejan de ser imposibles —ahí el interp sin bloquear pediría ~9,1 GiB por
+proceso—.
+
+**Bit a bit idéntico, no aproximado.** Verificado sobre t18_600 en 2005/2015/2024 contra la
+salida de `main`: 3 rásters × 10 bandas con `np.array_equal(equal_nan=True)`, manifiesto
+incluido. En tests, además, para subconjuntos de columnas, para todo tamaño de bloque
+(incluidos los que no dividen N) y para tiempos desordenados.
+
+**Caché de teselas de desarrollo (`BIODIV_TILE_CACHE`), que Argo no define y por lo tanto
+nunca usa.** En producción cada tesela se visita una sola vez y la caché sería 0,7 GB de
+escritura para nada. Existe porque iterar sobre el bucle de años costaba la carga entera de
+Landsat cada vez —714 s medidos en el tramo 1998-2026—; con la caché la misma corrida baja a
+**1m54** y da salida idéntica. Los arreglos se mapean en memoria, así que un acierto no cuesta
+copia y el bucle de años pagina sólo la ventana que toca. La escritura es atómica
+(`tmp.replace(d)`) y la geometría se re-verifica contra la tesela, de modo que una caché
+escrita para otra grilla no puede ser recogida por una tesela del mismo nombre.
+
+Esa caché es, a escala de una tesela, el mismo producto que propone `docs/24`: la medición de
+714 s → 0 s es la evidencia más directa que hay de cuánto vale materializar la carga.
+
+### 8.9 El pod de Argo usaba un séptimo de sí mismo (medido y corregido 2026-09-10)
+
+El pod pide `cpu: '7'` y corría `--jobs 1`: seis de sus siete núcleos ociosos. **Ninguna de
+las dos mitades de una tesela puede usar el pod entero por sí sola**, y las dos razones ya
+estaban medidas en este documento sin que se sacara la consecuencia:
+
+- la carga está topada por el GIL en **~0,7 de un núcleo** (§8.1: GDAL lo retiene mientras
+  parsea las cabeceras COG; medido instantáneo, no promedio de vida del proceso);
+- la eficiencia por hilo de torch cae a **63 % con cuatro hilos** (§8.6).
+
+Lo que sí escala es un proceso monohilo por núcleo, cada uno con una tesela entera, porque la
+espera de S3 de una se solapa con la CNN de otra. Medido en el pod de Jupyter de 7 núcleos
+(`taskset -c 0-6`, 7 teselas, 3 años):
+
+| `--jobs` | teselas/h | vs `--jobs 4` |
+|---:|---:|---:|
+| 4 | 27,4 | 1,00x |
+| 7 | **42,6** | 1,56x |
+
+1,75x los procesos comprando 1,56x el trabajo: **89 % de eficiencia, sin señales de pared**.
+Contra el `--jobs 1 --workers 0` medido antes (2.044 s para 4 teselas × 5 años), el cambio
+vale **~1,6x end to end**.
+
+**Queda en 6 y no en 7 a propósito.** En el pod de desarrollo `limit` no está puesto y
+`taskset` sólo reparte, pero en Argo `limit == request`: a utilización exactamente igual a la
+cuota el throttling de CFS frena todo el cgroup por períodos de 100 ms, y eso cuesta más que
+el núcleo que se deja libre. Antes de subir a 7 hay que mirar `/sys/fs/cgroup/cpu.stat`
+(`nr_throttled`) en un chunk real; el pod de desarrollo no puede responderlo porque no tiene
+cuota.
+
+**La memoria no es el límite**, y lo es gracias a §8.8: 1,24 GB por proceso medidos en un
+tramo de 400 fechas, ~1,8 GB en el tramo de producción (`obs` crece con las fechas), o sea
+~11 GB de los 30 Gi del pod.
+
+**El chunk se dimensiona contra el deadline, no contra la tesela.** A ~32 min por tesela por
+proceso (27 años), una ronda de seis dura ~32 min:
+
+| teselas/pod | rondas | duración | ¿entra en 7.200 s? |
+|---:|---:|---:|---|
+| 18 (90/5) | 3 | ~96 min | **sí**, ~20 % de margen |
+| 24 | 4 | ~128 min | no, los pods mueren en el deadline |
+
+Las teselas por pod tienen que ser **múltiplo de 6** o la última ronda corre con procesos
+ociosos. El default pasa a `-p limit-tiles=90 -p num-chunks=5`. La corrida del 2026-09-08 se
+estrelló contra esta misma pared con la aritmética vieja (50 teselas / 5 chunks, 10 por pod,
+~150 min sobre `--jobs 1`).
+
+`parallelism` no se toca: un solo cambio por vez, para poder atribuir el resultado.
+
+**Dos consecuencias de correr seis hijos en vez de uno**, ambas de corrección y no de
+rendimiento. `configure_s3_access` registra una config rio **por defecto** que no cruza a un
+subproceso, así que las variables de entorno de requester-pays (`AWS_REQUEST_PAYER`) dejan de
+ser un cinturón redundante y pasan a ser la única cosa que sostiene el acceso a
+`usgs-landsat` en los seis hijos. Y `--mapbiomas-dir` dejó de ser obligatorio
+(`mapbiomas.rasters_dir` ya apunta por defecto a ese prefijo); se deja escrito como
+declaración explícita. Corolario documental: los rásters de MapBiomas **no** se copian al pod
+—son COGs leídos por ventana desde S3, 0,79 s la máscara de una tesela de 10 km—, así que
+copiar 3,6 GB a cada pod no compraría nada.
