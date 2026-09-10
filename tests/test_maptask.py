@@ -452,3 +452,41 @@ def test_zarr_path_builds_an_s3_uri():
     uri = mt._zarr_path("s3://bucket/prefix/", tile, cfg)
     assert uri == f"s3://bucket/prefix/v{mt._CACHE_VERSION}_t18_600_30m_2003_2024.zarr"
     assert isinstance(mt._zarr_path("/tmp/cube", tile, cfg), Path)
+
+
+def test_zarr_exists_answers_without_reading_the_array(tmp_path, monkeypatch):
+    """Resuming a build must not download the cube to discover it is already built.
+
+    `_zarr_read` pulls `values` in full, so using it as the resume check would move the whole
+    store per tile -- measured 6,6 s against 0,071 s for this probe, or ~10,6 h and ~1,9 TB
+    across 5.769 tiles instead of ~7 min. It still has to apply the same two guards, so this
+    pins the cheap answer *and* that it stays as strict as the expensive one.
+    """
+    import numpy as np
+    import xarray as xr
+    import zarr
+
+    from biodiv import maptask as mt
+
+    da = xr.DataArray(np.zeros((4, 3, 3), np.float32),
+                      coords={"time": np.arange("2003-01-01", "2003-01-05",
+                                                dtype="datetime64[D]").astype("datetime64[ns]"),
+                              "y": np.arange(3.0), "x": np.arange(3.0)},
+                      dims=("time", "y", "x"), name="kndvi")
+    cfg = mt.TileConfig(years=[2005], resolution=30, dest="", tags={})
+    tile = {"tile_id": "t0_0", "xmin": 0.0, "ymin": 0.0, "xmax": 90.0, "ymax": 90.0}
+
+    assert mt._zarr_exists(str(tmp_path), tile, cfg) is False        # nothing written yet
+    p = mt.zarr_write(str(tmp_path), tile, cfg, da)
+    assert mt._zarr_exists(str(tmp_path), tile, cfg) is True
+
+    # the same guards `_zarr_read` applies
+    assert mt._zarr_exists(str(tmp_path), dict(tile, xmin=999.0), cfg) is False
+    zarr.open_group(str(p), mode="r+").attrs.put({})                 # interrupted build
+    assert mt._zarr_exists(str(tmp_path), tile, cfg) is False
+
+    # and it must not touch the data
+    def boom(*a, **k):                                               # pragma: no cover
+        raise AssertionError("_zarr_exists read the array")
+    monkeypatch.setattr(zarr.Array, "__getitem__", boom)
+    assert mt._zarr_exists(str(tmp_path), tile, cfg) is False

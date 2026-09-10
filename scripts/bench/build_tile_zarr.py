@@ -79,7 +79,7 @@ def main() -> None:
         dc = datacube.Datacube(app="biodiv-build-tile-zarr")
 
     for tile in pd.read_csv(a.tiles_file).to_dict("records"):
-        if a.skip_existing and mt._zarr_read(out, tile, cfg) is not None:
+        if a.skip_existing and mt._zarr_exists(out, tile, cfg):
             print(f"{tile['tile_id']}: already built, skipped", flush=True)
             continue
         t = time.perf_counter()

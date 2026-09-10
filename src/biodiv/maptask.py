@@ -285,6 +285,29 @@ def _zarr_read(root: str, tile: dict, cfg: TileConfig):
                         dims=("time", "y", "x"), name="kndvi")
 
 
+def _zarr_exists(root: str, tile: dict, cfg: TileConfig) -> bool:
+    """Whether a complete store for this tile is already there, without reading it.
+
+    `_zarr_read` pulls the whole array down, which is the wrong question to ask 5.769 times
+    when resuming a build pass: it would drag the entire cube across the network to decide it
+    has nothing to do. This touches only the group metadata -- one small GET on S3 -- and
+    applies the two guards that decide the answer anyway: the completion marker (`bbox`, which
+    `zarr_write` puts last) and the geometry.
+
+    For a whole run, listing the prefix once is cheaper still; this is the per-tile question.
+    """
+    p = _zarr_path(root, tile, cfg)
+    if isinstance(p, Path) and not p.exists():
+        return False
+    try:
+        import zarr
+        g = zarr.open_group(str(p), mode="r")
+    except Exception:                                               # noqa: BLE001
+        return False
+    return list(g.attrs.get("bbox", ())) == [tile["xmin"], tile["ymin"],
+                                             tile["xmax"], tile["ymax"]]
+
+
 def zarr_write(root: str, tile: dict, cfg: TileConfig, da, clevel: int = 5,
                tchunk: int = _ZARR_TCHUNK):
     """Materialise one tile's kNDVI as a Zarr store. Returns its `Path` or ``s3://`` URI.
