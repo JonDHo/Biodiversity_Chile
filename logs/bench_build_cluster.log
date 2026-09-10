@@ -1,0 +1,41 @@
+# docs/24 §7 paso 6a -- la pasada de construccion: dc.load -> .compute() -> Zarr en S3.
+# scripts/bench/build_tile_zarr.py, nodo de 8 vCPU sin GPU, t18_600, span 2003-2024
+# (1.504 fechas, 333x333), clevel 1, tchunk 128, salida a s3://.../_cube_bench/
+# Las dos ramas se corrieron una despues de otra en la misma maquina el mismo dia.
+
+=== A/B del scheduler, carga completa desde dc.load ===
+arm                      carga      escribir a S3   tamanio     CPU sostenida
+--load-threads 4        688,8 s        4,6 s        335,8 MB    0,1-0,6 nucleos de 8
+--workers 7 (cluster)   292,2 s        6,2 s        335,8 MB    2,3-2,5 nucleos de 8
+                        -----
+                        2,36x
+
+Reproduce el 2,3x que docs/21 §8.10 midio sobre la carga sola (258,1 s con threads=4
+contra 107,9 s con cluster=7), ahora sobre una tesela completa de 22 anios que ademas
+escribe el Zarr a S3. El cluster registro los 7 workers pedidos, a diferencia del arm
+de §8.10 que pidio 7 y reporto 5.
+
+=== la compuerta: cambiar de scheduler no cambia los bytes ===
+threads=4  vs cluster=7        : BIT-IDENTICAL  peor abs 0,000e+00  patron de NaN igual
+cluster=7  vs store de Fase 0  : BIT-IDENTICAL  peor abs 0,000e+00  patron de NaN igual
+threads=4  vs store de Fase 0  : BIT-IDENTICAL  peor abs 0,000e+00  patron de NaN igual
+
+El store de Fase 0 se construyo en otra sesion y otro dia, asi que esto reestablece la
+compuerta de docs/21 §8.14 a traves de un cambio de scheduler Y a traves de corridas.
+
+=== segundos-nucleo, que es la otra forma de rankear ===
+threads=4   688,8 s x ~0,7 nucleos ~= 482 s-nucleo por tesela
+cluster=7   292,2 s x ~2,4 nucleos ~= 701 s-nucleo por tesela  (1,45x mas)
+
+O sea que el cluster compra 2,36x de pared pagando ~1,45x de CPU. Por nodo alquilado
+gana sin discusion; por segundo-nucleo no. La comparacion que faltaria para cerrarlo es
+N construcciones threads=4 concurrentes en el mismo nodo, que NO se midio -- la carga
+esta limitada por latencia, no por CPU, asi que cabrian varias. El 0,7 de nucleo del
+arm de hilos viene de muestreo grueso con top (dos muestras: 10 % y 62 %) mas la mediana
+de 0,72 de §8.10; el 2,4 del cluster son seis muestras estables de 2,3-2,5.
+
+=== nota operativa ===
+El cluster emite `UserWarning: Sending large graph of size 11.66 MiB` en cada tesela: son
+las ~1.504 tareas de dask_chunks={"time": 1} serializadas al scheduler. El scheduler de
+hilos no lo paga porque corre en proceso. Es costo fijo por tesela y no impidio el 2,36x,
+pero es la primera sospecha si el speedup no se sostiene a 27 anios.

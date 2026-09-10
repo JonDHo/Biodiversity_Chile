@@ -44,6 +44,15 @@ def main() -> None:
     ap.add_argument("--from-cache", type=Path)
     ap.add_argument("--from-dc", action="store_true")
     ap.add_argument("--resolution", type=int, default=30)
+    ap.add_argument("--workers", type=int, default=0,
+                    help="dask LocalCluster workers for the `--from-dc` load (0 = none, use "
+                         "the threaded scheduler). This is the knob that matters for a build "
+                         "pass: docs/21 section 8.10 measured the load alone at 258,1 s with "
+                         "threads=4, 240,2 s with threads=8, and 107,9 s with cluster=7 -- "
+                         "2,3x, and the thread knob nearly flat. The reason section 8.10 "
+                         "still recommends threads for `scripts/73` does not apply here: "
+                         "there the cluster's workers stay alive through the CNN and tax it "
+                         "19 %%, and a build pass has no CNN (docs/24 section 4).")
     ap.add_argument("--load-threads", type=int, default=4, dest="load_threads",
                     help="dask threaded-scheduler threads for the `--from-dc` load. The "
                          "`TileConfig` default is 0, which is the synchronous path and costs "
@@ -66,44 +75,70 @@ def main() -> None:
 
     years = [int(v) for v in a.years.split(",")]
     cfg = mt.TileConfig(years=years, dest="", tags={}, resolution=a.resolution,
-                        load_threads=a.load_threads)
+                        load_threads=a.load_threads, load_client=a.workers > 0)
     out = a.out
     if not out.startswith("s3://"):
         Path(out).mkdir(parents=True, exist_ok=True)
 
-    dc = None
+    dc = client = cluster = configure_s3_access = None
     if a.from_dc:
         import datacube
         from datacube.utils.aws import configure_s3_access
-        configure_s3_access(aws_unsigned=False, requester_pays=True)
+        if a.workers > 0:
+            from dask.distributed import Client, LocalCluster
+            cluster = LocalCluster(n_workers=a.workers, processes=True, threads_per_worker=1)
+            client = Client(cluster)
+            print(f"dask: local cluster, {a.workers} workers", flush=True)
+        else:
+            print(f"load: dask threaded scheduler, {a.load_threads} threads", flush=True)
+        # Boot order is not negotiable, same as `scripts/73`: cluster, then
+        # configure_s3_access(client=...), then the Datacube. `usgs-landsat` is requester-pays,
+        # and passing `client` is what propagates that to the workers -- setting it only in the
+        # driver leaves every worker read failing with AccessDenied.
+        configure_s3_access(aws_unsigned=False, requester_pays=True, client=client)
         dc = datacube.Datacube(app="biodiv-build-tile-zarr")
 
-    for tile in pd.read_csv(a.tiles_file).to_dict("records"):
-        if a.skip_existing and mt._zarr_exists(out, tile, cfg):
-            print(f"{tile['tile_id']}: already built, skipped", flush=True)
-            continue
-        t = time.perf_counter()
-        if a.from_cache:
-            da = mt._cache_read(str(a.from_cache), tile, cfg)
-            if da is None:
-                raise SystemExit(f"no cache for {tile['tile_id']} at {a.from_cache}")
-            src = "cache"
-        else:
-            da = mt.load_tile(dc, tile, cfg)
-            if da is None:
-                raise SystemExit(f"no data for {tile['tile_id']}")
-            src = "dc.load"
-        read = time.perf_counter() - t
+    try:
+        for tile in pd.read_csv(a.tiles_file).to_dict("records"):
+            if a.skip_existing and mt._zarr_exists(out, tile, cfg):
+                print(f"{tile['tile_id']}: already built, skipped", flush=True)
+                continue
+            t = time.perf_counter()
+            if a.from_cache:
+                da = mt._cache_read(str(a.from_cache), tile, cfg)
+                if da is None:
+                    raise SystemExit(f"no cache for {tile['tile_id']} at {a.from_cache}")
+                src = "cache"
+            else:
+                # Per tile, not once before the loop. GDAL holds the credential values it was
+                # given and cannot renew them from the service-account token the way boto3 does,
+                # so a build pass outliving its role session starts failing every read with
+                # RasterioIOError('The provided token has expired') -- the same reason
+                # `maptask.run_one` refreshes per tile. It only reaches STS near expiry.
+                configure_s3_access(aws_unsigned=False, requester_pays=True, client=client)
+                da = mt.load_tile(dc, tile, cfg)
+                if da is None:
+                    raise SystemExit(f"no data for {tile['tile_id']}")
+                src = "dc.load"
+            read = time.perf_counter() - t
 
-        t = time.perf_counter()
-        kw = {} if a.tchunk < 0 else {"tchunk": a.tchunk}
-        p = mt.zarr_write(out, tile, cfg, da, clevel=a.clevel, **kw)
-        wrote = time.perf_counter() - t
-        size = store_bytes(p)
-        raw = da.values.nbytes
-        print(f"{tile['tile_id']}: {da.shape} from {src} in {read:.1f}s -> "
-              f"{size / 1e6:.1f} MB ({raw / size:.2f}x) in {wrote:.1f}s  {p}",
-              flush=True)
+            t = time.perf_counter()
+            kw = {} if a.tchunk < 0 else {"tchunk": a.tchunk}
+            p = mt.zarr_write(out, tile, cfg, da, clevel=a.clevel, **kw)
+            wrote = time.perf_counter() - t
+            size = store_bytes(p)
+            raw = da.values.nbytes
+            print(f"{tile['tile_id']}: {da.shape} from {src} in {read:.1f}s -> "
+                  f"{size / 1e6:.1f} MB ({raw / size:.2f}x) in {wrote:.1f}s  {p}",
+                  flush=True)
+
+    finally:
+        _shutdown(client, cluster)
+
+def _shutdown(client, cluster) -> None:
+    for x in (client, cluster):
+        if x is not None:
+            x.close()
 
 
 if __name__ == "__main__":

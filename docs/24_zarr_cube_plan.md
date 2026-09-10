@@ -179,14 +179,24 @@ Tres trampas más, todas de forma y no de tamaño:
   tesela?" — la misma lógica que ya usa `tile_progress.py`. Se pierde la elegancia del dataset
   único, pero calza con el patrón de acceso, porque la inferencia lee una tesela por vez.
 
-**¿Se puede escribir un Zarr de este tamaño, y con qué máquina?** Sí, cómodamente, y es más
-fácil de lo que suena porque **la escritura es en streaming y vergonzosamente paralela**: nunca
-se sostiene el arreglo en memoria, cada worker escribe sus chunks y los olvida. El costo está
+**¿Se puede escribir un Zarr de este tamaño, y con qué máquina?** Sí, cómodamente. Pero el
+motivo que daba este párrafo **no es el que aplica al código que existe**, y conviene decirlo
+porque de ahí salía el dimensionamiento de RAM. Decía que "la escritura es en streaming y
+vergonzosamente paralela: nunca se sostiene el arreglo en memoria, cada worker escribe sus
+chunks y los olvida". **`load_tile` hace `.compute()`**, o sea que junta la tesela entera en el
+driver y el driver escribe todos los chunks: al span de 27 años son ~820 MB residentes por
+tesela concurrente, no cero. Es perfectamente pagable —la regla de 4 GB/vCPU de `docs/21` §8.9
+lo cubre, y §8.10 midió el RSS del driver idéntico en todos los arms, así que `load_client=True`
+no lo infla— y no se persigue la escritura distribuida, porque `zarr_write` esquiva
+`xarray.to_zarr` a propósito (la codificación CF del tiempo rompería la identidad bit a bit,
+§8.14) y porque escribir son 4-6 s contra ~300-690 s de carga. Lo que había que corregir es el
+número, no la decisión. El costo está
 dominado por el lado de la *lectura*, que es la misma carga de COGs que ya se hace:
 
 | | |
 |---|---|
 | por worker | ~732 MB de la tesela + ~2 GB de transitorio de carga ≈ **~3 GB** — igual que hoy, así que aplica la misma regla de 4 GB/vCPU de `docs/21` §8.9 |
+| en el driver | **~820 MB residentes por tesela concurrente** al span de 27 años — ver la corrección de abajo |
 | trabajo total | 5.769 × ~825 s ≈ **~1.322 horas-proceso** |
 | en un m7i.16xlarge (64 vCPU) | ~21 h; dos nodos, ~10 h; en los 5 pods de Argo a `--jobs 6`, ~2 días |
 | ancho de banda de escritura | 1 TB en 21 h ≈ **~14 MB/s agregados**. El PUT de S3 no es un problema |
@@ -422,10 +432,24 @@ vez que la carga está materializada.
    el año-tesela, 4 procesos por T4 sin degradarse, rásters dentro de 5,85e-6 del rango de banda
    contra 1e-4 declarado.
 6. **Construir.** Lo que queda, en orden:
-   - **6a. La pasada de construcción**: `scripts/73` (o un job derivado de
-     `scripts/bench/build_tile_zarr.py`) sobre las 5.769 teselas, escribiendo un store por tesela
-     a S3, `--load-threads 4`, clevel 1, spot de CPU barato, reanudación por "¿existe el store?".
-     ~984 horas-proceso, ~2,3 TB, ~50 USD al mes de almacenamiento.
+   - **6a. La pasada de construcción**: un job derivado de
+     `scripts/bench/build_tile_zarr.py` sobre las 5.769 teselas, escribiendo un store por tesela
+     a S3, **`--workers 7`**, clevel 1, spot de CPU barato, reanudación por "¿existe el store?".
+     ~2,3 TB, ~50 USD al mes de almacenamiento.
+
+     **El scheduler ya no es `--load-threads 4`, y eso cambia el costo a la mitad y algo más**
+     (`docs/21` §8.17). Este documento venía costeando la construcción con la forma que §8.10
+     recomienda para `scripts/73`, que es la afinada alrededor de la CNN — una restricción que
+     la construcción no tiene, como decía §4 sin haberlo medido. Medido ahora sobre una tesela
+     completa: **688,8 s con `threads=4` contra 292,2 s con `cluster=7`, 2,36x**, y los rásters
+     bit a bit idénticos entre las dos ramas y contra el store de Fase 0. Las **~984
+     horas-proceso** de este plan pasan a **~417 horas-nodo** si el 2,36x se sostiene al span de
+     27 años.
+
+     Salvedad honesta: el cluster gana la pared pagando ~1,45x de segundos-núcleo (~701 contra
+     ~482 por tesela). Por nodo alquilado —que es como se paga— gana igual. Lo que no se midió,
+     y cerraría la pregunta, es correr **N construcciones `threads=4` concurrentes** en un mismo
+     nodo: la carga está limitada por latencia y no por CPU, así que caben varias.
    - ~~**6b. Leer el cubo desde S3**~~ **HECHO y medido** (`docs/21` §8.16): `zarr_write` y
      `_zarr_read` entienden `s3://`, y las cuatro teselas leídas desde un prefijo real salen
      **bit a bit idénticas** a los stores locales. Directo de S3 son ~3,1 s por tesela en

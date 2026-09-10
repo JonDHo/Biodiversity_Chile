@@ -1114,3 +1114,56 @@ test en `tests/test_maptask.py`.
 4. **`--jobs 4` se midió con 4 teselas y procesos recién nacidos.** El wall de esos barridos
    incluye ~12 s de spawn e import que una corrida de producción, con procesos largos, no paga;
    por eso la comparación de arriba usa el tiempo medido *dentro* del worker y no el wall.
+
+### 8.17 La pasada de construcción quiere el cluster, y no cambia los bytes (medido 2026-09-10)
+
+`docs/24` §4 decía que la fase de construcción es aquella donde el cluster de dask sí gana,
+porque no hay CNN detrás a la que gravar. Estaba dicho y no medido, y `build_tile_zarr.py`
+corría mientras tanto con `--load-threads 4`, que es la forma que §8.10 recomienda para
+`scripts/73` — o sea la configuración afinada alrededor de una restricción que la construcción
+no tiene. Medido sobre t18_600, span 2003-2024, las dos ramas seguidas en la misma máquina:
+
+| arm | carga | escribir a S3 | CPU sostenida |
+|---|---:|---:|---|
+| `--load-threads 4` | 688,8 s | 4,6 s | 0,1-0,6 núcleos de 8 |
+| **`--workers 7`** | **292,2 s** | 6,2 s | 2,3-2,5 núcleos de 8 |
+| | **2,36x** | | |
+
+**Reproduce el 2,3x de §8.10** —que allí se midió sobre la carga sola, 258,1 s contra 107,9 s—
+ahora sobre una tesela completa de 22 años que además escribe el Zarr a S3. Y esta vez el
+cluster registró los 7 workers pedidos, no los 5 que §8.10 tuvo que anotar como salvedad.
+
+**La compuerta aguanta el cambio de scheduler.** Es lo que había que verificar antes que el
+tiempo, porque un scheduler que reordena tareas es exactamente el tipo de cambio que podría
+mover el orden de empate dentro del mismo día solar (§8.14, `docs/24` §3):
+
+| | |
+|---|---|
+| `threads=4` vs `cluster=7` | **BIT-IDENTICAL**, peor abs 0,000e+00, patrón de NaN igual |
+| `cluster=7` vs el store de Fase 0 | **BIT-IDENTICAL**, peor abs 0,000e+00 |
+| `threads=4` vs el store de Fase 0 | **BIT-IDENTICAL**, peor abs 0,000e+00 |
+
+El store de Fase 0 se construyó en otra sesión y otro día, así que esto reestablece la
+identidad de §8.14 **a través de un cambio de scheduler y a través de corridas**, que es más de
+lo que la Fase 0 había probado.
+
+#### La salvedad, que apunta al otro lado
+
+Rankeado por **segundos-núcleo** en vez de por pared, el cluster no gana: ~701 s-núcleo por
+tesela (292,2 × ~2,4) contra ~482 (688,8 × ~0,7). Compra 2,36x de pared pagando ~1,45x de CPU.
+Por nodo alquilado gana sin discusión, que es la unidad en la que se paga; por segundo-núcleo
+no. Lo que cerraría la pregunta es medir **N construcciones `threads=4` concurrentes en un
+mismo nodo** —la carga está limitada por latencia y no por CPU, así que caben varias— y eso
+**no se midió**. Queda como la comparación pendiente, no como una recomendación.
+
+Las cifras de CPU no son simétricas en calidad: el ~2,4 del cluster son seis muestras estables
+de 2,3-2,5, mientras que el ~0,7 del arm de hilos sale de dos muestras de `top` muy dispares
+(10 % y 62 %) apoyadas en la mediana de 0,72 que §8.10 midió bien. Tómese el segundo como orden
+de magnitud.
+
+#### Una nota operativa que sólo aparece con el cluster
+
+Cada tesela emite `UserWarning: Sending large graph of size 11.66 MiB`: son las ~1.504 tareas de
+`dask_chunks={"time": 1}` serializadas al scheduler. El scheduler de hilos no lo paga porque
+corre en proceso. Es costo fijo por tesela, no impidió el 2,36x, y es la primera sospecha si el
+speedup no se sostiene al span de 27 años — donde el grafo crece a ~1.850 tareas.
