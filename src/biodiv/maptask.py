@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import io
 import os
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -151,6 +152,74 @@ class TileConfig:
     mapbiomas_dir: str = ""
     device: str = "cpu"
     smearing_exact: bool = False                # evaluate the 128 draws instead of tabulating
+    interp_block: int = 20000                   # pixel columns per `interp_common_grid` pass
+
+
+#: Directory for the development tile cache. Unset -- which is what the Argo path and every
+#: production run leave it -- means no cache at all, and `load_tile` behaves exactly as
+#: before. See `_cache_read`.
+TILE_CACHE_ENV = "BIODIV_TILE_CACHE"
+
+#: Bumped whenever the cached layout or the meaning of the array changes, so a stale cache
+#: is ignored rather than silently feeding the wrong numbers into a comparison.
+_CACHE_VERSION = 1
+
+
+def _cache_dir(root: str, tile: dict, cfg: TileConfig) -> Path:
+    span = f"{cfg.years[0] - 2}_{cfg.years[-1]}"
+    return Path(root) / f"v{_CACHE_VERSION}_{tile['tile_id']}_{cfg.resolution}m_{span}"
+
+
+def _cache_read(root: str, tile: dict, cfg: TileConfig):
+    """A previously loaded tile, or None.
+
+    **Development scaffolding, not a production feature.** A real run visits each tile once,
+    so this would never hit and would write ~0.7 GB per tile for nothing; it exists because
+    iterating on the year loop otherwise pays the full Landsat load (measured 714 s for the
+    1998-2026 span) on every attempt. The arrays are memory-mapped, so a hit costs no copy
+    and the year loop pages in only the window it touches.
+
+    The geometry is re-checked against the tile rather than trusted from the key, so a cache
+    written for a different grid cannot be picked up by a same-named tile.
+    """
+    import json
+    d = _cache_dir(root, tile, cfg)
+    meta = d / "meta.json"
+    if not meta.exists():
+        return None
+    try:
+        m = json.loads(meta.read_text())
+        if m.get("bbox") != [tile["xmin"], tile["ymin"], tile["xmax"], tile["ymax"]]:
+            return None
+        import xarray as xr
+        values = np.load(d / "values.npy", mmap_mode="r")
+        times = np.load(d / "times.npy")
+        x, y = np.load(d / "x.npy"), np.load(d / "y.npy")
+    except Exception:                                               # noqa: BLE001
+        return None                                                 # a torn cache is a miss
+    if values.shape != (len(times), len(y), len(x)):
+        return None
+    return xr.DataArray(values, coords={"time": times, "y": y, "x": x},
+                        dims=("time", "y", "x"), name="kndvi")
+
+
+def _cache_write(root: str, tile: dict, cfg: TileConfig, da) -> None:
+    import json
+    d = _cache_dir(root, tile, cfg)
+    tmp = d.with_name(d.name + f".part{os.getpid()}")
+    try:
+        tmp.mkdir(parents=True, exist_ok=True)
+        np.save(tmp / "values.npy", np.asarray(da.values, np.float32))
+        np.save(tmp / "times.npy", da.time.values)
+        np.save(tmp / "x.npy", da.x.values)
+        np.save(tmp / "y.npy", da.y.values)
+        (tmp / "meta.json").write_text(json.dumps(
+            {"bbox": [tile["xmin"], tile["ymin"], tile["xmax"], tile["ymax"]],
+             "resolution": cfg.resolution, "version": _CACHE_VERSION}))
+        tmp.replace(d)                       # atomic: a half-written cache is never read
+    except Exception as e:                                          # noqa: BLE001
+        print(f"tile cache: not written ({type(e).__name__}: {e})", flush=True)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def load_tile(dc, tile: dict, cfg: TileConfig):
@@ -168,6 +237,12 @@ def load_tile(dc, tile: dict, cfg: TileConfig):
     8 dask *processes* takes 304 s. So threads inside a tile are worth about 3x and no more,
     and the parallelism that actually pays is one process per tile.
     """
+    cache = os.environ.get(TILE_CACHE_ENV)
+    if cache:
+        hit = _cache_read(cache, tile, cfg)
+        if hit is not None:
+            print(f"tile cache: hit for {tile['tile_id']}", flush=True)
+            return hit
     bbox = (tile["xmin"], tile["ymin"], tile["xmax"], tile["ymax"])
     lazy = cfg.load_client or cfg.load_threads > 0
     da = mi.load_kndvi(dc, bbox, cfg.years[0] - 2, cfg.years[-1], resolution=cfg.resolution,
@@ -177,6 +252,8 @@ def load_tile(dc, tile: dict, cfg: TileConfig):
     if hasattr(da.data, "compute"):
         da = (da.compute() if cfg.load_client
               else da.compute(scheduler="threads", num_workers=cfg.load_threads))
+    if cache:
+        _cache_write(cache, tile, cfg, da)
     return da
 
 
@@ -206,22 +283,35 @@ def run_tile(dc, tile: dict, cfg: TileConfig, ens, resid, y_train,
     rows = []
     for y in todo:
         ty = time.time()
-        curves, n_obs, lo, hi = mi.year_curves(times, obs, y)
+        # The mask comes first, and the window before the interpolation, because the
+        # interpolation is the one expensive step and most of the tile is not native: on the
+        # measured tiles 25-42 % of pixels survive `run`, and the rest used to be
+        # interpolated and thrown away one line later. `year_window` still derives the grid
+        # span from every pixel of the tile, so the plot-cube convention is untouched.
         if cfg.mask == "mapbiomas":
             native, minfo = native_mask(y, template)
         else:
             native, minfo = np.ones((ny, nx), bool), {}
         nat = native.reshape(-1)
-        run = np.isfinite(curves).all(axis=1) & nat
+        t_win, o_win, n_obs, grid, lo, hi = mi.year_window(times, obs, y)
+        # `np.isfinite(curves).all(axis=1)` is exactly `n_obs >= MIN_OBS`: a curve comes back
+        # NaN only where the pixel had no clear observation at all (then every grid point is
+        # NaN, never some of them) or where `interp_common_grid` blanked it for having fewer
+        # than MIN_OBS. So which pixels are worth running is known before interpolating.
+        usable = n_obs >= mi.MIN_OBS
+        run = usable & nat
         pred = np.full((ny * nx, len(targets)), np.nan, np.float32)
-        if run.any():
-            images = ens.model_inputs(curves[run])
-            pred[run] = ens.predict(images, ctx.iloc[np.flatnonzero(run)],
+        if grid is not None and run.any():
+            sel = np.flatnonzero(run)
+            curves, _ = mi.interp_common_grid(t_win, np.ascontiguousarray(o_win[:, sel]),
+                                              grid, block=cfg.interp_block)
+            images = ens.model_inputs(curves)
+            pred[run] = ens.predict(images, ctx.iloc[sel],
                                     resid_scaled=resid, y_train=y_train, batch=cfg.batch,
                                     exact=cfg.smearing_exact)
         layers = {t: pred[:, j].reshape(ny, nx) for j, t in enumerate(targets)}
         layers["n_obs"] = n_obs.reshape(ny, nx).astype(np.float32)
-        layers["span_days"] = np.where(np.isfinite(curves).all(axis=1), hi - lo,
+        layers["span_days"] = np.where(usable, hi - lo,
                                        np.nan).reshape(ny, nx).astype(np.float32)
         layers["native"] = native.astype(np.float32)
         tags = dict(cfg.tags, year=y, window=f"{y - 2}-01-01/{y}-12-31",

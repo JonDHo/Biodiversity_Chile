@@ -253,3 +253,74 @@ def test_resume_retries_failures_and_skips_only_successes(tmp_path):
     done, n_bad = s73.resume_done(man)
     assert done == {("tA", 2020)}
     assert n_bad == 2
+
+
+# --------------------------------------------------------------------------------------
+# the development tile cache
+# --------------------------------------------------------------------------------------
+
+def _fake_tile_da(T=11, ny=7, nx=5):
+    import xarray as xr
+    times = np.arange("2018-01-01", "2018-01-12", dtype="datetime64[D]").astype("datetime64[ns]")
+    vals = np.random.default_rng(0).normal(0.3, 0.05, (T, ny, nx)).astype(np.float32)
+    vals[3, 2, 2] = np.nan
+    return xr.DataArray(vals, coords={"time": times[:T], "y": np.arange(ny) * 30.0,
+                                      "x": np.arange(nx) * 30.0},
+                        dims=("time", "y", "x"), name="kndvi")
+
+
+def _cache_cfg(years=(2020, 2021), resolution=30):
+    return mt.TileConfig(years=years, dest="", tags={}, resolution=resolution)
+
+
+def test_tile_cache_round_trips_exactly_and_memory_maps(tmp_path):
+    tile = dict(tile_id="tTEST", xmin=0.0, ymin=0.0, xmax=9990.0, ymax=9990.0)
+    cfg = _cache_cfg()
+    da = _fake_tile_da()
+    assert mt._cache_read(str(tmp_path), tile, cfg) is None       # cold
+    mt._cache_write(str(tmp_path), tile, cfg, da)
+    got = mt._cache_read(str(tmp_path), tile, cfg)
+    assert got is not None
+    assert np.array_equal(da.values, got.values, equal_nan=True)
+    assert np.array_equal(da.time.values, got.time.values)
+    assert np.array_equal(da.x.values, got.x.values)
+    assert np.array_equal(da.y.values, got.y.values)
+    # memory-mapped, and not a dask array: `load_tile` must not try to compute it
+    assert isinstance(got.data, np.memmap)
+    assert not hasattr(got.data, "compute")
+
+
+def test_tile_cache_misses_rather_than_serving_the_wrong_tile(tmp_path):
+    """Every way the key could be stale has to miss, not return someone else's pixels.
+
+    A cache that answered here would feed the wrong array into a bit-for-bit comparison and
+    the difference would look like a code bug.
+    """
+    tile = dict(tile_id="tTEST", xmin=0.0, ymin=0.0, xmax=9990.0, ymax=9990.0)
+    cfg = _cache_cfg()
+    mt._cache_write(str(tmp_path), tile, cfg, _fake_tile_da())
+
+    assert mt._cache_read(str(tmp_path), dict(tile, xmax=1.0), cfg) is None      # other bbox
+    assert mt._cache_read(str(tmp_path), tile, _cache_cfg(years=(2005,))) is None  # other span
+    assert mt._cache_read(str(tmp_path), tile, _cache_cfg(resolution=60)) is None  # other res
+    # a torn cache is a miss, not an exception
+    (tmp_path / "v1_tTEST_30m_2018_2021" / "times.npy").unlink()
+    assert mt._cache_read(str(tmp_path), tile, cfg) is None
+
+
+def test_load_tile_ignores_the_cache_when_the_env_var_is_unset(tmp_path, monkeypatch):
+    """The production default. Argo sets nothing, so `load_tile` must never touch disk."""
+    monkeypatch.delenv(mt.TILE_CACHE_ENV, raising=False)
+    tile = dict(tile_id="tTEST", xmin=0.0, ymin=0.0, xmax=9990.0, ymax=9990.0)
+    cfg = _cache_cfg()
+    mt._cache_write(str(tmp_path), tile, cfg, _fake_tile_da())
+
+    calls = []
+
+    def fake_load_kndvi(dc, bbox, y0, y1, resolution=30, dask_chunks=None):
+        calls.append(bbox)
+        return None
+
+    monkeypatch.setattr(mt.mi, "load_kndvi", fake_load_kndvi)
+    assert mt.load_tile(None, tile, cfg) is None
+    assert len(calls) == 1                    # went to the cube, not to the populated cache

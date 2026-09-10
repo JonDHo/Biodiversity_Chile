@@ -87,8 +87,58 @@ def rolling_mean_shrinking(g: np.ndarray, roll: int) -> np.ndarray:
     return (c[..., b] - c[..., a]) / (b - a)
 
 
+def _interp_columns(t: np.ndarray, obs: np.ndarray, grid: np.ndarray, pos: np.ndarray,
+                    pos_after: np.ndarray, roll: int, min_obs: int
+                    ) -> tuple[np.ndarray, np.ndarray]:
+    """`interp_common_grid` for one block of pixel columns. ``t`` must be sorted.
+
+    ``pos``/``pos_after`` are passed in because they depend only on ``t`` and ``grid``,
+    not on the pixels, so a blocked caller computes them once.
+    """
+    T, N = obs.shape
+    G = len(grid)
+    finite = np.isfinite(obs)
+    n_obs = finite.sum(axis=0)
+
+    # Forward/backward fill indices. int32, not the int64 numpy would pick: these are row
+    # numbers in a window of a few hundred dates, and the four (T, N) arrays here are the
+    # single largest allocation in the tile path -- 0.93 GB of a measured 2,345 MiB peak at
+    # 10 km. int32 is exact for any T that fits in memory, so this costs nothing.
+    rows = np.arange(T, dtype=np.int32)[:, None]
+    prev_idx = np.maximum.accumulate(np.where(finite, rows, np.int32(-1)), axis=0)
+    next_idx = np.minimum.accumulate(np.where(finite, rows, np.int32(T))[::-1], axis=0)[::-1]
+
+    p_idx = np.where(pos[:, None] >= 0, prev_idx[np.clip(pos, 0, T - 1)], np.int32(-1))
+    n_idx = np.where(pos_after[:, None] <= T - 1,
+                     next_idx[np.clip(pos_after, 0, T - 1)], np.int32(T))
+
+    have_p = p_idx >= 0
+    have_n = n_idx < T
+    cols = np.arange(N)[None, :]
+    vp = obs[np.where(have_p, p_idx, np.int32(0)), cols].astype(np.float64)
+    vn = obs[np.where(have_n, n_idx, np.int32(0)), cols].astype(np.float64)
+    tp = t[np.where(have_p, p_idx, np.int32(0))]
+    tn = t[np.where(have_n, n_idx, np.int32(0))]
+
+    out = np.full((G, N), np.nan)
+    both = have_p & have_n
+    same = both & (tn <= tp)
+    lin = both & ~same
+    # `np.copyto(out, v, where=c)` rather than `out = np.where(c, v, out)`: identical
+    # result, but writes in place instead of allocating a fresh (G, N) float64 per branch.
+    w = np.where(lin, (grid[:, None] - tp) / np.where(lin, tn - tp, 1.0), 0.0)
+    np.copyto(out, vp + w * (vn - vp), where=lin)
+    np.copyto(out, vp, where=same)
+    np.copyto(out, vp, where=have_p & ~have_n)                         # beyond last obs
+    np.copyto(out, vn, where=~have_p & have_n)                         # before first obs
+
+    curves = rolling_mean_shrinking(out.T, roll)                       # (N, G)
+    curves = np.where((n_obs >= min_obs)[:, None], curves, np.nan)
+    return curves.astype(np.float32), n_obs
+
+
 def interp_common_grid(t: np.ndarray, obs: np.ndarray, grid: np.ndarray,
-                       roll: int = ROLL, min_obs: int = MIN_OBS
+                       roll: int = ROLL, min_obs: int = MIN_OBS, block: int = 0
                        ) -> tuple[np.ndarray, np.ndarray]:
     """Vectorised `interp_grid` for many pixels sharing one grid.
 
@@ -97,58 +147,39 @@ def interp_common_grid(t: np.ndarray, obs: np.ndarray, grid: np.ndarray,
     pixel with fewer than ``min_obs`` finite observations is all-NaN. Matches
     ``interp_grid(t[ok], v[ok], G, roll, t_min=grid[0], t_max=grid[-1])`` pixel by pixel
     (np.interp semantics: constant extrapolation beyond the first/last observation).
+
+    ``block`` interpolates that many pixel columns at a time instead of all of them. Every
+    step here is independent per column -- the only reduction, `rolling_mean_shrinking`, runs
+    along the grid axis -- so a blocked result is bit-identical to an unblocked one; what it
+    changes is the transient, which is ~20x the ``(T, N)`` input and is what bounds how many
+    tiles fit in a pod. 0 (the default) keeps the original single-shot behaviour.
     """
     t = np.asarray(t, float)
     obs = np.asarray(obs, np.float32)
     if obs.ndim != 2:
         raise ValueError("obs must be (T, N)")
     T, N = obs.shape
-    G = len(grid)
-    order = np.argsort(t, kind="stable")
-    t, obs = t[order], obs[order]
-    finite = np.isfinite(obs)
-    n_obs = finite.sum(axis=0)
+    # A stable argsort of already-sorted times is `arange`, so the re-sort is a pure copy of
+    # the whole (T, N) array. `load_kndvi` sorts by time, so on the map path it always is.
+    if not (t[:-1] <= t[1:]).all():
+        order = np.argsort(t, kind="stable")
+        t, obs = t[order], obs[order]
 
-    # forward fill: last valid value/time at or before each observation row
-    idx = np.where(finite, np.arange(T)[:, None], -1)
-    prev_idx = np.maximum.accumulate(idx, axis=0)                      # (T, N), -1 = none
-    # backward fill: first valid at or after each row
-    idx_b = np.where(finite, np.arange(T)[:, None], T)
-    next_idx = np.minimum.accumulate(idx_b[::-1], axis=0)[::-1]        # (T, N), T = none
-
-    # position of each grid point among the observation times
+    # position of each grid point among the observation times -- pixel-independent
     pos = np.searchsorted(t, grid, side="right") - 1                   # last t <= grid
     pos_after = np.searchsorted(t, grid, side="left")                  # first t >= grid
-    pos_c = np.clip(pos, 0, T - 1)
-    pos_after_c = np.clip(pos_after, 0, T - 1)
 
-    p_idx = np.where(pos[:, None] >= 0, prev_idx[pos_c], -1)           # (G, N)
-    n_idx = np.where(pos_after[:, None] <= T - 1, next_idx[pos_after_c], T)
+    if block <= 0 or block >= N:
+        return _interp_columns(t, obs, grid, pos, pos_after, roll, min_obs)
 
-    have_p = p_idx >= 0
-    have_n = n_idx < T
-    p_safe = np.where(have_p, p_idx, 0)
-    n_safe = np.where(have_n, n_idx, 0)
-    cols = np.arange(N)[None, :]
-    vp = obs[p_safe, cols].astype(np.float64)
-    vn = obs[n_safe, cols].astype(np.float64)
-    tp = t[p_safe]
-    tn = t[n_safe]
-
-    out = np.full((G, N), np.nan)
-    both = have_p & have_n
-    same = both & (tn <= tp)
-    w = np.zeros_like(out)
-    denom = np.where(both & ~same, tn - tp, 1.0)
-    w = np.where(both & ~same, (grid[:, None] - tp) / denom, 0.0)
-    out = np.where(both & ~same, vp + w * (vn - vp), out)
-    out = np.where(same, vp, out)
-    out = np.where(have_p & ~have_n, vp, out)                          # beyond last obs
-    out = np.where(~have_p & have_n, vn, out)                          # before first obs
-
-    curves = rolling_mean_shrinking(out.T, roll)                       # (N, G)
-    curves = np.where((n_obs >= min_obs)[:, None], curves, np.nan)
-    return curves.astype(np.float32), n_obs
+    curves = np.empty((N, len(grid)), np.float32)
+    n_obs = np.empty(N, int)
+    for s in range(0, N, block):
+        e = min(s + block, N)
+        c, n = _interp_columns(t, np.ascontiguousarray(obs[:, s:e]), grid, pos, pos_after,
+                               roll, min_obs)
+        curves[s:e], n_obs[s:e] = c, n
+    return curves, n_obs
 
 
 def year_curves(times: np.ndarray, obs: np.ndarray, year: int, ngs: int = NGS,
@@ -161,20 +192,57 @@ def year_curves(times: np.ndarray, obs: np.ndarray, year: int, ngs: int = NGS,
     clear pixel in the tile (the plot-cube convention). Curves are all-NaN when fewer than
     two such dates exist.
     """
-    m = window_mask(times, year)
-    if m.sum() == 0:
-        return (np.full((obs.shape[1], ngs), np.nan, np.float32),
-                np.zeros(obs.shape[1], int), np.nan, np.nan)
-    t = days_since_epoch(times[m])
-    o = obs[m]
-    any_clear = np.isfinite(o).any(axis=1)
+    t, o, n_obs, grid, lo, hi = year_window(times, obs, year, ngs=ngs)
+    if grid is None:
+        return np.full((obs.shape[1], ngs), np.nan, np.float32), n_obs, lo, hi
+    curves, _ = interp_common_grid(t, o, grid, roll=roll)
+    return curves, n_obs, lo, hi
+
+
+def year_window(times: np.ndarray, obs: np.ndarray, year: int, ngs: int = NGS
+                ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray,
+                           np.ndarray | None, float, float]:
+    """Everything `year_curves` needs *before* interpolating anything.
+
+    Returns ``(t, o, n_obs, grid, lo, hi)``; ``grid`` is None when the window cannot produce
+    curves at all, and then ``t``/``o`` are None too.
+
+    Split out so a caller can decide **which pixels are worth interpolating** before paying
+    for it: `interp_common_grid` is ~20x the size of its own input in transient allocation,
+    and `maptask.run_tile` throws away 58-75 % of it against the MapBiomas native mask
+    immediately afterwards.
+
+    What cannot be deferred is ``lo``/``hi``: the grid spans the first and last acquisition
+    in the window with at least one clear pixel **anywhere in the tile** (the plot-cube
+    convention), so masking to native pixels first would silently move the grid. That span
+    is computed here, over every pixel, from the same single `isfinite` pass that produces
+    ``n_obs`` -- two reductions, no interpolation.
+    """
+    n = obs.shape[1]
+    lo_d = np.datetime64(f"{year - 2}-01-01")
+    hi_d = np.datetime64(f"{year}-12-31")
+    days = times.astype("datetime64[D]")
+    # `load_kndvi` sorts by time, so the window is a contiguous run and `o` can be a view.
+    # The boolean fallback copies (~115 MB per year at 10 km) and is only for unsorted input.
+    if (days[:-1] <= days[1:]).all():
+        sel: slice | np.ndarray = slice(int(np.searchsorted(days, lo_d, side="left")),
+                                        int(np.searchsorted(days, hi_d, side="right")))
+        empty = sel.start >= sel.stop
+    else:
+        sel = window_mask(times, year)
+        empty = not sel.any()
+    if empty:
+        return None, None, np.zeros(n, int), None, np.nan, np.nan
+
+    o = obs[sel]
+    fin = np.isfinite(o)
+    n_obs = fin.sum(axis=0)
+    any_clear = fin.any(axis=1)
     if any_clear.sum() < 2:
-        return (np.full((obs.shape[1], ngs), np.nan, np.float32),
-                np.isfinite(o).sum(axis=0), np.nan, np.nan)
+        return None, None, n_obs, None, np.nan, np.nan
+    t = days_since_epoch(times[sel])
     lo, hi = t[any_clear].min(), t[any_clear].max()
-    grid = np.linspace(lo, hi, ngs)
-    curves, n_obs = interp_common_grid(t, o, grid, roll=roll)
-    return curves, n_obs, float(lo), float(hi)
+    return t, o, n_obs, np.linspace(lo, hi, ngs), float(lo), float(hi)
 
 
 def reference_curve(t_days: np.ndarray, v: np.ndarray, t_min: float, t_max: float,

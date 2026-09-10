@@ -172,3 +172,93 @@ def test_tile_grid_snaps_and_covers():
     assert float(g2.xmax.iloc[0] - g2.xmin.iloc[0]) == step
     with pytest.raises(ValueError):
         mi.tile_grid((0, 0, 1, 1), 1, 30)
+
+
+# --------------------------------------------------------------------------------------
+# what makes it safe to mask before interpolating (`maptask.run_tile`)
+# --------------------------------------------------------------------------------------
+
+def test_finite_curve_is_exactly_the_min_obs_threshold():
+    """`isfinite(curves).all(axis=1) == (n_obs >= MIN_OBS)`, the identity `run_tile` rests on.
+
+    It lets the native mask be applied before the interpolation instead of after it. If a
+    curve could ever be *partially* finite, or finite below MIN_OBS, the reordering would
+    silently change which pixels are predicted -- so this is checked at every count on
+    either side of the threshold, not just on a random sample.
+    """
+    rng = np.random.default_rng(11)
+    T, G = 60, mi.NGS
+    t = np.sort(rng.uniform(0, 1095, T))
+    grid = np.linspace(t[0], t[-1], G)
+    counts = list(range(0, 2 * mi.MIN_OBS)) + [T]
+    obs = np.full((T, len(counts) * 8), np.nan, np.float32)
+    for i, c in enumerate(counts):
+        for r in range(8):
+            rows = rng.choice(T, size=c, replace=False)
+            obs[rows, i * 8 + r] = rng.normal(0.3, 0.05, c)
+
+    curves, n_obs = mi.interp_common_grid(t, obs, grid)
+    finite = np.isfinite(curves)
+    assert np.array_equal(finite.all(axis=1), n_obs >= mi.MIN_OBS)
+    # never partially finite: a curve is all-NaN or has no NaN at all
+    assert not (finite.any(axis=1) & ~finite.all(axis=1)).any()
+
+
+def test_interp_common_grid_column_subset_matches_the_full_result():
+    """Interpolating a subset of pixels gives those pixels' rows of the full result."""
+    t, obs = _synthetic(T=120, N=400, seed=5)
+    grid = np.linspace(t.min(), t.max(), mi.NGS)
+    full, n_full = mi.interp_common_grid(t, obs, grid)
+    sel = np.random.default_rng(2).choice(obs.shape[1], 137, replace=False)
+    sub, n_sub = mi.interp_common_grid(t, np.ascontiguousarray(obs[:, sel]), grid)
+    assert np.array_equal(full[sel], sub, equal_nan=True)
+    assert np.array_equal(n_full[sel], n_sub)
+
+
+@pytest.mark.parametrize("block", [1, 7, 64, 399, 400, 4096])
+def test_interp_common_grid_blocking_is_bit_identical(block):
+    """Blocking bounds the transient; it must not move a single bit of the result.
+
+    Includes block sizes that do not divide N, and one larger than N.
+    """
+    t, obs = _synthetic(T=120, N=400, seed=6)
+    grid = np.linspace(t.min(), t.max(), mi.NGS)
+    a, na = mi.interp_common_grid(t, obs, grid)
+    b, nb = mi.interp_common_grid(t, obs, grid, block=block)
+    assert np.array_equal(a, b, equal_nan=True)
+    assert np.array_equal(na, nb)
+
+
+def test_year_window_grid_span_comes_from_every_pixel():
+    """The grid spans the window's first/last date clear *anywhere in the tile*.
+
+    This is the plot-cube convention, and it is why `run_tile` may mask before it
+    interpolates but may not mask before it computes the span: here only pixel 3 is ever
+    clear on the first and last dates, so a span computed from the other pixels would be
+    narrower and every curve in the tile would land on a different grid.
+    """
+    times = np.arange("2003-01-05", "2006-01-01", 16, dtype="datetime64[D]")
+    T = len(times)
+    obs = np.full((T, 6), np.nan, np.float32)
+    m = mi.window_mask(times, 2005)
+    idx = np.flatnonzero(m)
+    obs[idx, 3] = 0.4                                  # pixel 3 clear on every window date
+    obs[idx[5:-5], :3] = 0.35                          # the rest clear only in the middle
+
+    t, o, n_obs, grid, lo, hi = mi.year_window(times, obs, 2005)
+    days = mi.days_since_epoch(times[m])
+    assert np.isclose(lo, days[0]) and np.isclose(hi, days[-1])
+    assert grid is not None and len(grid) == mi.NGS
+    # and `year_curves` agrees with the split it was refactored into
+    curves, n2, lo2, hi2 = mi.year_curves(times, obs, 2005)
+    assert np.array_equal(n_obs, n2) and lo == lo2 and hi == hi2
+
+
+def test_year_window_reports_no_grid_for_an_empty_window():
+    times = np.arange("2003-01-05", "2006-01-01", 16, dtype="datetime64[D]")
+    obs = np.full((len(times), 4), 0.4, np.float32)
+    t, o, n_obs, grid, lo, hi = mi.year_window(times, obs, 2030)
+    assert grid is None and t is None and o is None
+    assert n_obs.sum() == 0 and np.isnan(lo) and np.isnan(hi)
+    # nothing is usable, so `run_tile` predicts nothing -- the identity still holds
+    assert not (n_obs >= mi.MIN_OBS).any()
