@@ -1,0 +1,25 @@
+tile 333x333, 238 dates, 59.7% finite (40.3% NaN), raw 106 MB
+
+Layouts -- full time axis, whole-tile spatial block
+  chunks (t,y,x)               MB   ratio  write s  MB/tile @full
+  warnings.warn(
+  (238, 333, 333)            50.8   2.08x      1.2            386
+  warnings.warn(
+  (238, 333, 333)            49.8   2.12x      1.9            379
+  warnings.warn(
+  (238, 167, 167)            49.9   2.11x      0.7            380
+  warnings.warn(
+  (238, 64, 64)              50.1   2.11x      0.6            381
+
+Decompression scaling -- does blosc release the GIL? (local disk, store opened once)
+   threads        s  speedup
+         1    0.174    1.00x
+         2    0.112    1.55x
+         4    0.078    2.24x
+         8    0.066    2.63x
+
+Chunk alignment -- same 333x333 window out of a 666x666 mosaic
+  warnings.warn(
+  aligned (333 px chunks)        1.11 s   store  199.3 MB
+  warnings.warn(
+  misaligned (256 px chunks)     0.24 s   store  200.2 MB

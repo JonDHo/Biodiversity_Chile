@@ -47,15 +47,46 @@ demás. Cuatro consecuencias, en el orden que importa:
    serlo sobre tres cuartos. Por eso la caché va primero y la GPU después: al revés compra
    mucho menos.
 
-**Dimensionamiento (estimación, la Fase 0 lo mide).** Por tesela: 110.889 px × ~1.650 fechas ×
-4 B ≈ **732 MB** en crudo, quizá **~180 MB** comprimido. Para las 5.769 teselas eso da **~4,2 TB**
-crudo (~4,6 TB si se toma el conteo de 1.811 fechas de §6 en vez de 1.650 — la Fase 0 fija
-cuál corresponde) y del orden de **~1 TB** comprimido. El arreglo es mayoritariamente NaN, pero
-**la fracción exacta hay que medirla, no suponerla**, y el plan no debe apoyarse en el ~1 TB
-hasta que la Fase 0 lo confirme.
+**Dimensionamiento — ya no es estimación, se midió (2026-09-11, `scripts/bench/bench_zarr.py`,
+`logs/bench_zarr.log`).** Sobre t18_600, tramo 2018-2020, 238 fechas, 333 × 333 px:
 
-Vale notar que el cubo es **más chico que lo que se transfiere hoy**: el camino actual trae
-`red` + `nir` + `qa_pixel` como uint16 (~6 B/px/fecha) para derivar un kNDVI de 4 B.
+| | medido | lo que decía este documento |
+|---|---:|---:|
+| fracción NaN | **40,3 %** | ~55 % |
+| razón de compresión (blosc-zstd) | **2,1x** | implícita ~4x |
+| por tesela al tramo completo | **~381 MB** | ~180 MB |
+| **total de las 5.769 teselas** | **~2,2 TB** | ~1 TB |
+
+**El cubo es más del doble de lo que este plan suponía.** El arreglo es bastante menos disperso
+de lo que se había asumido, y ahí se va la diferencia entera. Ni el nivel de zstd (3 contra 5:
+50,8 y 49,8 MB) ni el tamaño de chunk (de la tesela entera a bloques de 64 px: 49,8 a 50,1 MB)
+mueven la aguja, así que no hay nada que afinar por ese lado. A precios de S3 son ~50 USD al mes,
+o sea que el tamaño no es un impedimento — pero el número había que corregirlo.
+
+Vale seguir notando que el cubo es **más chico que lo que se transfiere hoy**: el camino actual
+trae `red` + `nir` + `qa_pixel` como uint16 (~6 B/px/fecha) para derivar un kNDVI de 4 B.
+
+**Corrección al punto 3 de arriba: el argumento del GIL era el equivocado, y la conclusión es
+mucho mejor de lo que decía.** Se midió la descompresión con el store abierto una sola vez, para
+no cronometrar el costo fijo de abrirlo:
+
+| hilos | s | speedup |
+|---:|---:|---:|
+| 1 | 0,174 | 1,00x |
+| 2 | 0,112 | 1,55x |
+| 4 | 0,078 | 2,24x |
+| 8 | 0,066 | **2,63x** |
+
+O sea que **blosc tampoco escala linealmente, y ni siquiera le gana al 3,4x de GDAL** de §8.1.
+El punto 3 tal como estaba escrito es falso. Pero es irrelevante, y por la mejor de las razones:
+al tramo de producción esa descompresión son **~1,3 s a un solo hilo**, contra los **~700 s** que
+cuesta hoy abrir ~5.970 cabeceras COG. La ganancia no es una curva de escalado mejor; es que **no
+queda prácticamente nada que escalar** — del orden de 500x sobre el término de carga, antes de
+sumarle la transferencia desde S3.
+
+Con eso, el presupuesto por tesela de §2 pasa de ~1.915 s a **~1.218 s (−36 %)**, y el forward
+queda en el **77 %** de la tesela, que es exactamente el régimen en el que la GPU pasa a ser una
+palanca grande (§6).
 
 ## 3. Fase 0 — consistencia a pequeña escala, antes de cualquier decisión de escalado
 
@@ -78,7 +109,17 @@ Ese último es el que se pasa por alto. `interp_common_grid` ordena por tiempo c
 llegaron; si el Zarr las guarda en otro orden, las curvas cambian aunque el conjunto de datos
 sea el mismo.
 
-**La prueba es barata y es la única que hay que correr antes de decidir nada más:**
+**RESUELTO (2026-09-11): la premisa de la compuerta se verificó primero, y pasa.** Decir "bit a
+bit idéntico a `dc.load`" no significa nada si `dc.load` no es reproducible, así que eso se midió
+antes que nada: dos corridas de `load_kndvi` en **procesos separados** sobre t18_600 (238 fechas)
+dan valores, tiempos, coordenadas **y la coordenada `sensor`** idénticos. `sensor` registra de qué
+producto vino cada adquisición, que es exactamente lo que se movería si el orden de empate fuera
+inestable — así que la prueba toca el riesgo y no su alrededor. Procesos separados a propósito:
+dentro de un mismo proceso un caché de índice tibio escondería justo la inestabilidad buscada.
+**La identidad bit a bit sigue siendo una compuerta válida.** Harness:
+`scripts/bench/check_load_determinism.py`.
+
+**La prueba que queda, y es la única que hay que correr antes de decidir nada más:**
 
 1. materializar **una** tesela (t18_600, que es la que tiene línea base en §6, §8.7 y §8.8);
 2. correr `scripts/73` contra el Zarr y contra `dc.load`, mismos años;
@@ -86,9 +127,17 @@ sea el mismo.
    — el mismo protocolo que validó §8.8;
 4. `scripts/74` en ALL PASS.
 
-Salidas de la Fase 0, además del veredicto: fracción real de NaN, tamaño comprimido de una
-tesela, tiempo de construcción de una tesela, y tiempo de lectura desde el Zarr con 1, 4 y 8
-hilos —que es lo que confirma o refuta el punto 3 de §2—.
+Las otras salidas que la Fase 0 tenía que producir —fracción de NaN, tamaño comprimido, escalado
+de lectura por hilos— **ya están medidas y están en §2**: 40,3 % NaN, 2,1x de compresión, ~2,2 TB
+en total, y una descompresión que escala apenas 2,63x con 8 hilos pero que a un solo hilo ya son
+~1,3 s contra ~700 s. Lo único que falta de la Fase 0 es el diff de rásters de arriba.
+
+Sobre la alineación de chunks: se intentó medir la amplificación de lectura leyendo la misma
+ventana de 333 px de un mosaico con chunks de 333 y de 256 px, y **el resultado salió al revés y
+no es concluyente** (1,11 s alineado contra 0,24 s desalineado, con el store desalineado leyendo
+*más* bytes). A esta escala la medición está dominada por costos fijos. No se persigue, porque la
+pregunta se disuelve sola con el diseño ya elegido: **un store por tesela** significa que ninguna
+tesela puede cruzar un chunk de otra, por construcción.
 
 Si la igualdad bit a bit no se alcanza, la decisión que sigue es **declarar una tolerancia o
 abandonar**, y esa es del autor, no del código.
