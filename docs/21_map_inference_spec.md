@@ -735,3 +735,97 @@ consultas llegan como ráfagas breves en los bordes de tesela, no como carga sos
 
 **El tamaño de batch es indiferente**: 3,12 / 3,01 / 3,12 s. No hay nada que ganar ahí en CPU
 (en GPU la historia cambia, ver `docs/24` §6).
+
+### 8.13 El forward no tiene palanca grande en CPU (medido 2026-09-11)
+
+Con la carga materializada o no, el forward de la CNN es **~49 % de los segundos-núcleo de una
+tesela** (~934 s de ~1.915 s por tesela por proceso: 27 años × 45 s, de los cuales el forward es
+el 77 % según §8.7 con la tabla de smearing). Es el término más grande que queda, más grande que
+la carga — lo que invierte la lectura ingenua de §8.4, que se midió a 10 años en workers de 2
+núcleos, antes de la 1D-CNN y antes de la tabla.
+
+Esta sección registra qué se intentó y qué no funcionó, para que nadie lo reintente. El harness
+es `scripts/bench/bench_forward.py`; la salida, `logs/bench_forward.log`.
+
+#### La hipótesis principal era falsa
+
+`FacetEnsemble.predict_scaled` recorre las cinco semillas en un **bucle secuencial**, cinco
+forwards sobre una entrada *idéntica*. Como los cinco miembros son arquitectónicamente iguales y
+sólo difieren en pesos, el tronco convolucional se puede correr como una sola convolución
+agrupada (`groups=5`, entrada repetida 5×): una pasada de 5× de ancho en vez de cinco angostas.
+El razonamiento era que 14.535 parámetros es intensidad aritmética muy baja, así que las cinco
+pasadas angostas están limitadas por latencia y caché, y ensanchar el canal es justo lo que esos
+kernels quieren.
+
+**No es así.** Medido con 16.384 px, 5 semillas, 1 hilo de torch (lo que pinnea Argo):
+
+| arm | s | vs actual | peor abs |
+|---|---:|---:|---:|
+| A bucle (actual) | 25,60 | 1,00x | — |
+| **B bucle + BN plegado** | **22,57** | **1,13x** | 9,5e-7 |
+| C agrupado | 26,62 | **0,96x** | 0 (bit a bit) |
+| D agrupado + BN plegado | 23,41 | 1,09x | 9,5e-7 |
+
+Las convoluciones agrupadas de PyTorch no alcanzan los mismos caminos de oneDNN que las densas,
+así que agrupar sale **más lento**. Es bit a bit idéntico, lo que no sirve de nada si es peor.
+
+#### Por qué, con el perfil por operación
+
+Perfilado de un forward, batch 8192, 1 hilo:
+
+| operación | % del forward |
+|---|---:|
+| `mkldnn_convolution` | 59,9 % |
+| **`gelu`** | **17,7 %** |
+| `native_batch_norm` | 11,3 % |
+| `copy_` (de `_pad_circular`) | 10,3 % |
+
+**El 40 % del forward no es convolución.** Plegar los BatchNorm elimina ese 11,3 % y predice
+1,13x — que es exactamente lo medido, así que el modelo del costo está entendido y no adivinado.
+
+Dentro de la convolución, el reparto no sigue a los MACs:
+
+| | % de los MACs | % del tiempo de convolución |
+|---|---:|---:|
+| pointwise (1×1, son GEMM) | 87,7 % | 51,7 % |
+| **depthwise (k=5)** | **9,6 %** | **42,2 %** |
+| stem | 2,7 % | 6,2 % |
+
+Las depthwise pagan una penalización de eficiencia de ~4,4x: cada canal es un filtro de 5 taps
+independiente, no hay GEMM que explotar y el kernel queda limitado por memoria.
+
+#### El techo, que es lo que cierra la pregunta
+
+En vez de escribir kernels a mano contra una corazonada, se acotó cuánto hay para sacar
+**borrando trabajo**. Las dos últimas filas no son modelos válidos —borran la no linealidad y
+una convolución— y ese es el punto: si borrarlo no compra mucho, ninguna implementación más
+rápida lo va a comprar tampoco.
+
+| variante | vs actual |
+|---|---:|
+| BN plegado | 1,14x |
+| BN plegado + `GELU(approximate="tanh")` | **0,97x** |
+| BN plegado + padding de ceros en vez de circular | 1,31x |
+| **TECHO: además sin GELU y sin depthwise** | **2,03x** |
+
+Tres lecturas:
+
+1. **La aproximación tanh de GELU es más lenta** en este build. Se suma a `torch.compile` (4x más
+   lento) y al tamaño de batch (indiferente) en la lista de §8.12.
+2. **El padding circular cuesta ~1,15x por sí solo** (1,31 contra 1,14). Pero `padding_mode=
+   "circular"` no es un detalle de implementación: codifica que el año fenológico da la vuelta.
+   Cambiarlo a ceros es **otro modelo**, no una optimización, así que no está disponible.
+3. **El techo es 2,03x aun borrando componentes del modelo.** No hay una palanca grande escondida
+   acá.
+
+#### Conclusión
+
+Lo único disponible sin cambiar el modelo es plegar los BatchNorm: **1,13x sobre el forward, o
+~5,6 % de la tesela**, y cuesta la identidad bit a bit que se sostuvo en todo el trabajo anterior
+(peor error absoluto 9,5e-7; el relativo de 1,5e-1 es engañoso, porque son targets en espacio
+transformado que pasan por cero). Queda **medido y disponible, no integrado**: está por debajo
+del umbral de ~10 % de tesela con el que se está priorizando.
+
+**La palanca del forward es la GPU, no reestructurarlo en CPU** — y por eso el orden de
+`docs/24` importa: materializar la carga primero es lo que hace que la GPU valga la pena, y
+también lo que hace que se la pueda alimentar (`docs/24` §6).

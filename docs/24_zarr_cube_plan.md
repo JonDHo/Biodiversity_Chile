@@ -266,6 +266,49 @@ momento de decidir**, no asumirlo. Lo que cambia el cálculo es exactamente lo d
 con la carga materializada el forward pasa a ~77 % de la tesela y la GPU deja de ser 1,7x para
 ser una palanca de 5x o más. Por eso el orden importa.
 
+#### El problema no es sólo cuánto vale la GPU, es poder alimentarla
+
+Esto es más fuerte que el argumento de Amdahl de arriba, y es la razón operativa por la que la
+caché va primero.
+
+En CPU, `--jobs N` compra el solapamiento gratis: N procesos hacen carga→CNN cada uno, así que
+la espera de S3 de una tesela tapa la CNN de otra. **Eso no se traslada a una máquina con GPU**,
+porque los N procesos quieren la misma GPU. Y `fan_out` reinvoca el script como N subprocesos
+pasándole `--device` tal cual (`scripts/73_map_inference.py:628`), de modo que `--jobs 6
+--device cuda` daría N contextos CUDA —cientos de MB de VRAM cada uno para un modelo de 14.535
+parámetros— repartiéndose una GPU por time-slicing. Con un trabajo limitado por lanzamiento de
+kernels, que es el nuestro, eso empeora justo lo que ya duele.
+
+La forma correcta en una sola máquina es **cargadores como workers y la GPU en el driver**: dask
+(o un pool de procesos) hace sólo la carga —la parte topada por el GIL y limitada por latencia
+de S3, que sí escala con procesos— y un único proceso posee la GPU y consume teselas listas.
+Notar que acá `load_client=True` deja de ser un problema y pasa a ser lo que se quiere: computar
+al driver es correcto cuando el driver es el que tiene la GPU. Dos cuidados: **CUDA no sobrevive
+a `fork`**, así que no hay que propagar `--device cuda` a los workers —si sólo cargan, no hay
+CUDA en ningún worker y el problema no existe—; y cada cargador tiene que llamar a `dc.load`
+**sincrónicamente** dentro del worker, no armar un grafo lazy que se reenvía al scheduler que lo
+está corriendo, que es lo que costó 3.434 teselas (§8.5, §8.10).
+
+**Y acá está el aguijón.** Los cargadores tienen que producir teselas al ritmo que la GPU las
+consume. Un cargador son ~700 s de pared por tesela a ~0,72 de núcleo, así que:
+
+| tiempo de GPU por tesela | cargadores concurrentes | vCPU sólo para cargar |
+|---:|---:|---:|
+| 120 s | ~6 | ~4 |
+| 60 s | ~12 | ~8 |
+| 20 s | ~35 | ~25 |
+
+`t_gpu` no se sabe hasta que la prueba de arriba lo mida, y toda la tabla depende de él — otra
+razón para correr esa prueba antes de dimensionar nada. Pero la conclusión no depende del valor
+exacto: **sin el cubo materializado, un nodo con GPU tiene que cargar con suficiente vCPU para
+correr entre 6 y 35 cargadores de Landsat concurrentes sólo para no dejar la GPU en hambre**, es
+decir pagar precio de nodo GPU por una máquina que es sobre todo un cliente de S3.
+
+Dicho al revés, y es la formulación que ordena todo este documento: **el cubo Zarr *es* la
+separación entre carga y procesamiento**, hecha una sola vez, offline, en CPU barata, en vez de
+rehacerla adentro de cada hora-GPU. La Opción A de §5 es esa misma separación hecha por corrida
+en lugar de una sola vez.
+
 Cuándo una GPU sí sería una decisión fácil para este tipo de procesamiento, para tenerlo de
 referencia: un modelo materialmente más grande (un transformer, una U-Net sobre parches, o
 muchos más miembros de ensemble), o trabajo por píxel pesado en vez de diminuto (ajuste denso
