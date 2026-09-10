@@ -1027,3 +1027,90 @@ flota y pasa a ser **un nodo G4 chico corriendo alrededor de un día**.
    rodilla de 4-6 medida.
 4. **Una sola GPU y un solo modelo de GPU.** No se probó G5 ni nada más grande, a propósito: con
    el forward en 0,56 s por año-tesela no hay caso que hacer (§6 de `docs/24`).
+
+### 8.16 El cubo se lee desde S3, y sale bit a bit idéntico (medido 2026-09-10)
+
+Era el hueco nº 1 de §8.15 y el paso 6b de `docs/24` §7: todo lo medido hasta acá leía stores en
+**disco local**, y `zarr_write` / `_zarr_read` tomaban un `Path` y nada más. Ahora entienden
+`s3://`, y el cubo se leyó desde un prefijo real. Harness `scripts/bench/bench_zarr_s3.py`,
+salida en `logs/bench_zarr_s3.log`, sobre cuatro teselas del span 2003-2024 (1.482-1.504 fechas,
+272-336 MB comprimidos) en un nodo de 8 vCPU sin GPU.
+
+**Lo primero, porque es la compuerta:** las cuatro teselas leídas desde S3 son **bit a bit
+idénticas** a los mismos stores en disco local, en los dos layouts probados —valores con
+`equal_nan=True`, eje temporal, `x` e `y`—. Materializar en S3 no cuesta reproducibilidad, que
+es la única forma en que este paso podía salir mal en silencio.
+
+#### Cuánto cuesta, y contra qué se compara
+
+| | 1 proceso | `--jobs 4` |
+|---|---:|---:|
+| directo de S3, chunk entero | 4,1 s | 9,5 s |
+| **directo de S3, eje temporal cortado** | **3,1 s** | **8,3 s** |
+| copiar de S3 a disco local | 4,0 s | 5,6 s |
+| leer de disco local | **0,49 s** | 4,6 s |
+| copiar + leer, sin solapar | 4,5 s | 10,2 s |
+| home por NFS, chunk entero (línea base de la misma máquina) | 5,16 s | — |
+
+Escalado al span de 27 años (×1,23) y contra los ~70 s de tesela que §8.15 midió en una T4 a
+`--jobs 4`, leer directo de S3 son **~10 s por tesela, o ~13 % de la tesela**. No es gratis, pero
+tampoco se parece al 93 % que costaba leer COGs: el cubo sigue borrando la carga.
+
+#### El disco local del nodo GPU: sirve, pero sólo con prefetch
+
+La pregunta operativa es si conviene bajar el store al SSD del nodo antes de analizarlo. Los
+números dicen que **el bloqueante no es dónde vive el dato sino si la transferencia se solapa con
+el cómputo**, y eso es una cosa distinta de lo que suponía `docs/24` §5:
+
+- **Sin solapar, copiar es peor**: 4,5 s contra 3,1 s de leer directo. Los bytes cruzan la red
+  exactamente una vez en los dos casos, así que bajar primero sólo agrega un viaje por disco.
+  El argumento de §5 —"bajar a SSD primero significa leer el TB dos veces"— era el equivocado;
+  se lee una sola vez. Lo que hace perder a la copia es simplemente el disco de más.
+- **Solapando, el disco local gana y por mucho**: leer del disco local son **0,49 s** contra 3,1 s,
+  y la copia de ~4 s se esconde entera dentro de los ~70 s de GPU de la tesela anterior. El costo
+  visible pasa de ~13 % a **~1 % de la tesela**.
+- **Y hay lugar de sobra para esconderla.** A `--jobs 4`, con ~70 s de cómputo por tesela, el
+  enlace necesita ~22 MB/s. Lo medido en agregado con cuatro lectores concurrentes es **~150 MB/s**.
+  Sobra un factor de ~7, así que un hilo que baje la tesela N+1 mientras se computa la N no
+  compite con nada.
+
+O sea: **el SSD del nodo GPU vale ~12 % del tiempo de tesela, y sólo si se prefetchea**. Es una
+optimización de una fase que ya funciona sin ella, no un requisito — que es la conclusión a la
+que llegaba §5, pero por la razón contraria a la que daba.
+
+#### Cortar el eje temporal es gratis, así que ahora es el default
+
+La Fase 0 escribía el eje temporal como **un solo chunk**. Cortarlo es estrictamente mejor en las
+dos puntas y **no cuesta absolutamente nada de tamaño**: el store comprimido salió idéntico *al
+byte* —335,8 MB en t18_600— en los seis layouts probados, porque blosc ya comprime por bloques
+internamente. En disco local, escribir / leer: chunk entero 3,37 / 1,53 s, 188 fechas 1,36 / 0,45,
+94 fechas 1,31 / 0,40; monótono en las dos columnas. Desde S3, 3,1 s contra 4,1 s.
+
+El default pasa a **128 fechas por chunk** (`maptask._ZARR_TCHUNK`): cae entre los dos mejores
+puntos medidos y deja el chunk en ~28 MB comprimidos, bien por encima del piso de ~10 MB bajo el
+cual un store en S3 se vuelve un problema de listar objetos (`docs/24` §3). Los stores viejos se
+siguen leyendo: el chunking vive en los metadatos y `_zarr_read` no lo mira.
+
+#### La escritura interrumpida, que en S3 no se resuelve igual
+
+El camino local escribe bajo un nombre `.part` y lo mueve a su lugar, y ese `rename` es lo que
+hace que un store a medias nunca se lea. **S3 no tiene rename.** Lo que ocupa su lugar es el
+orden de escritura: primero los chunks, y los atributos **al final y en un solo `attrs.put`
+atómico**. Como `_zarr_read` exige `bbox` para aceptar un store, uno cuyos atributos no llegaron
+lee como **miss** y no como tesela corta — que es el modo de fallo peligroso, porque una tesela
+corta produce un mapa plausible y equivocado. Verificado contra S3 de verdad, y fijado con un
+test en `tests/test_maptask.py`.
+
+#### Lo que esto **no** cubre
+
+1. **Sigue sin medirse la corrida real de inferencia desde S3.** Lo de acá cronometra
+   `_zarr_read`, no `scripts/73` de punta a punta contra un cubo en S3 — el ~13 % sale de componer
+   esta medición con los ~70 s de tesela de §8.15, y componer no es medir.
+2. **El prefetch no está implementado.** El ~1 % es lo que costaría si la copia se solapa; hoy no
+   hay nada que la solape, así que el número que aplica al código como está es el ~13 %.
+3. **Una sola región y un solo día.** Las cifras de S3 son de un nodo en `us-west-2` contra un
+   bucket de la misma región. La varianza entre corridas se ve en la primera tesela de cada
+   barrido, que paga el establecimiento de la conexión y llega a duplicar el tiempo en régimen.
+4. **`--jobs 4` se midió con 4 teselas y procesos recién nacidos.** El wall de esos barridos
+   incluye ~12 s de spawn e import que una corrida de producción, con procesos largos, no paga;
+   por eso la comparación de arriba usa el tiempo medido *dentro* del worker y no el wall.

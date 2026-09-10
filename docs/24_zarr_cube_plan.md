@@ -1,11 +1,13 @@
 # Cubo kNDVI materializado: plan de prueba y de escalado
 
-**Estado (2026-09-10): la Fase 0 pasó y la prueba de GPU también.** Lo que era un plan con
+**Estado (2026-09-10): la Fase 0 pasó, la prueba de GPU también, y el cubo ya se lee desde S3.** Lo que era un plan con
 números derivados ya está medido: el cubo reproduce `dc.load` bit a bit y borra la carga (§3,
 `docs/21` §8.14), y la GPU corre el forward 91x más rápido con los rásters dentro de la
 tolerancia declarada (§6, `docs/21` §8.15). Las dos mediciones juntas cambian la arquitectura
 elegida: **una pasada de construcción sola, después toda la inferencia contra el cubo en un nodo
-G4 chico** — ver §3 y §7. Donde un número siga siendo derivado y no medido, se dice.
+G4 chico** — ver §3 y §7. El paso 6b —leer el cubo desde S3, que era la última incógnita
+técnica— también está hecho y medido (`docs/21` §8.16): bit a bit idéntico, ~13 % de la tesela.
+Donde un número siga siendo derivado y no medido, se dice.
 
 ## 1. Qué se propone
 
@@ -318,14 +320,24 @@ se midió: satura, pero muy por encima de lo que este trabajo le pide — ~1 % d
 tesela, ~0,23 q/s medios incluso a 128 procesos. El detalle está en `docs/21` §8.12. **No hace
 falta sondearlo de nuevo antes de elegir opción**, y no limita el tamaño de nodo.
 
-**El SSD local es una optimización, no un requisito.** Streamear el Zarr desde S3 alcanza: lo
-que hace lenta la carga de hoy es el *número de requests y la latencia*, no los bytes —~5.970
-aperturas de COG, 96 % costo fijo—, y el Zarr colapsa eso a unos pocos chunks por tesela, lo que
-mueve el cuello de latencia a ancho de banda, que es donde S3 es bueno. En una sola pasada cada
-tesela se lee exactamente una vez, así que bajar a SSD primero significa leer el TB **dos**
-veces. El SSD paga cuando hay re-lecturas: re-corridas, reinicios, experimentación de
-parámetros — que, dado el historial de reinicios de §8.5, puede muy bien ser el caso, pero es
-cinturón y tiradores, no la base del diseño.
+**El SSD local es una optimización, no un requisito — la conclusión aguanta, el argumento no.**
+Streamear el Zarr desde S3 alcanza, y eso ahora está medido (`docs/21` §8.16): lo que hace lenta
+la carga de hoy es el *número de requests y la latencia*, no los bytes —~5.970 aperturas de COG,
+96 % costo fijo—, y el Zarr colapsa eso a unos pocos chunks por tesela, lo que mueve el cuello de
+latencia a ancho de banda, que es donde S3 es bueno.
+
+Lo que este documento decía para descartarlo era que **"bajar a SSD primero significa leer el TB
+dos veces", y es falso**: los bytes cruzan la red exactamente una vez en los dos casos, y lo que
+la copia agrega es un viaje por disco, no una segunda lectura de S3. La distinción que sí manda
+es otra: **si la transferencia se solapa o no con el cómputo.** Sin solapar, copiar pierde (4,5 s
+contra 3,1 s de leer directo). Solapando, el disco local gana fuerte —leer de ahí son 0,49 s
+contra 3,1 s— y la copia de ~4 s se esconde entera dentro de los ~70 s de GPU de la tesela
+anterior, lo que baja el costo visible de ~13 % a ~1 % de la tesela. Y hay lugar de sobra: a
+`--jobs 4` el enlace necesita ~22 MB/s contra los ~150 MB/s medidos en agregado.
+
+Así que el SSD del nodo GPU vale **~12 % del tiempo de tesela y sólo con un hilo de prefetch**.
+Sigue siendo cinturón y tiradores y no la base del diseño, pero por una razón distinta de la que
+estaba escrita: no porque leer dos veces salga caro, sino porque leer directo ya sale barato.
 
 **Un beneficio adicional que sólo aparece con el cubo materializado:** deja de hacer falta
 cargar el tramo completo por adelantado. Leer sólo la ventana de 3 años de cada objetivo se
@@ -414,10 +426,14 @@ vez que la carga está materializada.
      `scripts/bench/build_tile_zarr.py`) sobre las 5.769 teselas, escribiendo un store por tesela
      a S3, `--load-threads 4`, clevel 1, spot de CPU barato, reanudación por "¿existe el store?".
      ~984 horas-proceso, ~2,3 TB, ~50 USD al mes de almacenamiento.
-   - **6b. Leer el cubo desde S3**, que es lo único de la Fase 0 que **no** está medido: todo lo
-     de acá se midió contra stores en disco local. Falta cronometrar `_zarr_read` contra un
-     prefijo `s3://` y decidir si `--jobs` alcanza para tapar esa latencia. Es la última
-     incógnita técnica y es chica.
+   - ~~**6b. Leer el cubo desde S3**~~ **HECHO y medido** (`docs/21` §8.16): `zarr_write` y
+     `_zarr_read` entienden `s3://`, y las cuatro teselas leídas desde un prefijo real salen
+     **bit a bit idénticas** a los stores locales. Directo de S3 son ~3,1 s por tesela en
+     solitario y ~8,3 s a `--jobs 4`, o sea **~13 % de la tesela** al span de 27 años contra los
+     ~70 s de GPU de §8.15. Dos cosas cambiaron de paso: cortar el eje temporal es gratis en
+     tamaño y mejor en las dos puntas, así que pasa a ser el default (128 fechas por chunk); y
+     como S3 no tiene rename, la escritura atómica se apoya en escribir los atributos al final,
+     de modo que un store a medias lee como *miss* y no como tesela corta.
    - **6c. La corrida de inferencia** en un `g4dn.xlarge`/`2xlarge` con `--jobs 4`.
 
 ## Referencias

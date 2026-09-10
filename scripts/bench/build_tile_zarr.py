@@ -26,11 +26,21 @@ from pathlib import Path
 import pandas as pd
 
 
+def store_bytes(p) -> int:
+    """Size of one store, whether it landed on disk or on S3."""
+    if isinstance(p, Path):
+        return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+    import s3fs
+    return sum(o["size"] for o in s3fs.S3FileSystem().find(p, detail=True).values())
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tiles-file", type=Path, required=True)
     ap.add_argument("--years", required=True, help="comma list, e.g. 2005,2015,2024")
-    ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--out", required=True,
+                    help="local directory or s3:// prefix for the stores. Left as a string on "
+                         "purpose: `Path` collapses the double slash of an s3:// URI.")
     ap.add_argument("--from-cache", type=Path)
     ap.add_argument("--from-dc", action="store_true")
     ap.add_argument("--resolution", type=int, default=30)
@@ -39,7 +49,15 @@ def main() -> None:
                          "`TileConfig` default is 0, which is the synchronous path and costs "
                          "~1,900 s a tile; `scripts/73` defaults to 4, the measured knee "
                          "(docs/21 section 8.1). Ignored by `--from-cache`.")
-    ap.add_argument("--clevel", type=int, default=5)
+    ap.add_argument("--clevel", type=int, default=1,
+                    help="zstd level. 1 is the measured choice: 3,2x faster than 5 and only "
+                         "3 %% bigger (docs/24 section 3).")
+    ap.add_argument("--tchunk", type=int, default=-1,
+                    help="dates per time chunk; -1 uses `maptask._ZARR_TCHUNK`, 0 writes the "
+                         "time axis as one chunk (the Fase 0 layout).")
+    ap.add_argument("--skip-existing", action="store_true", dest="skip_existing",
+                    help="leave tiles that already have a readable store alone, which is what "
+                         "makes the build pass resumable on spot capacity (docs/24 section 7).")
     a = ap.parse_args()
     if bool(a.from_cache) == bool(a.from_dc):
         ap.error("need exactly one of --from-cache or --from-dc")
@@ -49,7 +67,9 @@ def main() -> None:
     years = [int(v) for v in a.years.split(",")]
     cfg = mt.TileConfig(years=years, dest="", tags={}, resolution=a.resolution,
                         load_threads=a.load_threads)
-    a.out.mkdir(parents=True, exist_ok=True)
+    out = a.out
+    if not out.startswith("s3://"):
+        Path(out).mkdir(parents=True, exist_ok=True)
 
     dc = None
     if a.from_dc:
@@ -59,6 +79,9 @@ def main() -> None:
         dc = datacube.Datacube(app="biodiv-build-tile-zarr")
 
     for tile in pd.read_csv(a.tiles_file).to_dict("records"):
+        if a.skip_existing and mt._zarr_read(out, tile, cfg) is not None:
+            print(f"{tile['tile_id']}: already built, skipped", flush=True)
+            continue
         t = time.perf_counter()
         if a.from_cache:
             da = mt._cache_read(str(a.from_cache), tile, cfg)
@@ -73,12 +96,13 @@ def main() -> None:
         read = time.perf_counter() - t
 
         t = time.perf_counter()
-        p = mt.zarr_write(str(a.out), tile, cfg, da, clevel=a.clevel)
+        kw = {} if a.tchunk < 0 else {"tchunk": a.tchunk}
+        p = mt.zarr_write(out, tile, cfg, da, clevel=a.clevel, **kw)
         wrote = time.perf_counter() - t
-        size = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+        size = store_bytes(p)
         raw = da.values.nbytes
         print(f"{tile['tile_id']}: {da.shape} from {src} in {read:.1f}s -> "
-              f"{size / 1e6:.1f} MB ({raw / size:.2f}x) in {wrote:.1f}s  {p.name}",
+              f"{size / 1e6:.1f} MB ({raw / size:.2f}x) in {wrote:.1f}s  {p}",
               flush=True)
 
 

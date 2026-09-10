@@ -377,3 +377,78 @@ def test_zarr_store_rejects_a_different_grid(tmp_path):
     moved = dict(tile, xmin=999.0, xmax=1089.0)
     assert mt._zarr_read(str(tmp_path), moved, cfg) is None
     assert mt._zarr_read(str(tmp_path), tile, cfg) is not None
+
+
+def test_zarr_store_chunks_time_and_still_round_trips(tmp_path):
+    """The time axis is cut into blocks, and cutting it changes nothing about the values.
+
+    The default stopped being "one chunk for the whole span" once the cube had to be read
+    from S3 (`docs/21` 8.16), and a layout change is exactly the kind of thing that can be
+    right on the size report and wrong on the bytes -- so this pins both.
+    """
+    import numpy as np
+    import xarray as xr
+    import zarr
+
+    from biodiv import maptask as mt
+
+    rng = np.random.default_rng(1)
+    v = rng.random((20, 4, 4), dtype=np.float32)
+    v[3, 0, 0] = np.nan
+    times = np.arange("2003-01-01", "2003-01-21", dtype="datetime64[D]").astype("datetime64[ns]")
+    da = xr.DataArray(v, coords={"time": times, "y": np.arange(4.0), "x": np.arange(4.0)},
+                      dims=("time", "y", "x"), name="kndvi")
+    tile = {"tile_id": "t0_0", "xmin": 0.0, "ymin": 0.0, "xmax": 120.0, "ymax": 120.0}
+    cfg = mt.TileConfig(years=[2005], resolution=30, dest="", tags={})
+
+    p = mt.zarr_write(str(tmp_path), tile, cfg, da, tchunk=6)
+    assert zarr.open_group(str(p), mode="r")["values"].chunks == (6, 4, 4)
+
+    got = mt._zarr_read(str(tmp_path), tile, cfg)
+    assert got is not None
+    assert np.array_equal(got.values, v, equal_nan=True)
+    assert np.array_equal(got.time.values, times)
+
+
+def test_zarr_store_without_attributes_reads_as_a_miss(tmp_path):
+    """A store whose attributes never landed must read as a miss, not as a short tile.
+
+    On S3 there is no rename, so `zarr_write` cannot build under a `.part` name and move it
+    into place the way the local path does. What stands in for it is the order of writes:
+    chunks first, attributes last and in one atomic `put`. That only makes a torn store safe
+    if a store *without* attributes is a miss, which is what this pins -- the local branch is
+    used here because the property under test is `_zarr_read`'s, not the transport's.
+    """
+    import numpy as np
+    import xarray as xr
+    import zarr
+
+    from biodiv import maptask as mt
+
+    da = xr.DataArray(np.zeros((3, 2, 2), np.float32),
+                      coords={"time": np.array(["2003-01-01", "2004-01-01", "2005-01-01"],
+                                               "datetime64[ns]"),
+                              "y": np.arange(2.0), "x": np.arange(2.0)},
+                      dims=("time", "y", "x"), name="kndvi")
+    cfg = mt.TileConfig(years=[2005], resolution=30, dest="", tags={})
+    tile = {"tile_id": "t0_0", "xmin": 0.0, "ymin": 0.0, "xmax": 60.0, "ymax": 60.0}
+
+    p = mt.zarr_write(str(tmp_path), tile, cfg, da)
+    assert mt._zarr_read(str(tmp_path), tile, cfg) is not None
+
+    zarr.open_group(str(p), mode="r+").attrs.put({})    # as if the run died before the put
+    assert mt._zarr_read(str(tmp_path), tile, cfg) is None
+
+
+def test_zarr_path_builds_an_s3_uri():
+    """An ``s3://`` root yields a URI, not a `Path` that would collapse the double slash."""
+    from pathlib import Path
+
+    from biodiv import maptask as mt
+
+    cfg = mt.TileConfig(years=[2005, 2015, 2024], resolution=30, dest="", tags={})
+    tile = {"tile_id": "t18_600", "xmin": 0.0, "ymin": 0.0, "xmax": 60.0, "ymax": 60.0}
+
+    uri = mt._zarr_path("s3://bucket/prefix/", tile, cfg)
+    assert uri == f"s3://bucket/prefix/v{mt._CACHE_VERSION}_t18_600_30m_2003_2024.zarr"
+    assert isinstance(mt._zarr_path("/tmp/cube", tile, cfg), Path)

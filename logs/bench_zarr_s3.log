@@ -1,0 +1,47 @@
+# docs/24 §7 paso 6b -- leer el cubo desde S3. scripts/bench/bench_zarr_s3.py
+# Nodo CPU de 8 vCPU, sin GPU. Cuatro teselas materializadas, span 2003-2024
+# (1.482-1.504 fechas, 272-336 MB comprimidos), clevel 1.
+# "local disk" = overlay del contenedor (80 G). "home" = NFS 127.0.0.1:/home/jhodge.
+# Prefijo de S3: s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/_cube_bench
+
+=== escribir a S3 (upload) ===
+chunk entero   t17_599 7.7s  t17_600 6.4s  t18_599 6.9s  t18_600 6.9s
+tchunk 188     t17_599 5.3s  t17_600 3.9s  t18_599 4.3s  t18_600 4.3s
+tchunk 128     t18_600 5.3s                       (contra 4,2 s en disco local, bench_zarr_write.log)
+tamano identico en los tres: 335,8 MB en t18_600
+
+=== leer de S3, directo, 1 proceso (--mode direct) ===
+chunk entero   t17_599 8.10s*  t17_600 3.86s  t18_599 4.06s  t18_600 4.10s   ~4,1 s en regimen
+tchunk 188     t17_599 7.17s*  t17_600 2.63s  t18_599 3.55s  t18_600 3.13s   ~3,1 s en regimen
+tchunk 128     t18_600 2.83s (mejor de 3)
+* la primera tesela paga el establecimiento de la conexion; no es representativa
+VERIFICACION contra los stores locales: BIT-IDENTICAL en las 4 teselas, ambos layouts
+
+=== leer de S3, directo, 4 procesos (--jobs 4) ===
+chunk entero   por tesela 9.27-9.67s   wall 22.07s   (5.52 s/tesela)
+tchunk 188     por tesela 7.90-8.69s   wall 21.02s   (5.25 s/tesela)
+el wall incluye ~12 s de spawn+import de 4 procesos, que en produccion no se paga
+
+=== copiar de S3 a disco local y leer ahi (--mode copy, tchunk 188) ===
+1 proceso   copy 3.82-4.23s   read 0.46-0.49s   (la primera 3.67s en frio)
+4 procesos  copy 5.21-5.92s   read 4.48-4.97s   wall 22.76s
+
+=== barrido de tchunk en disco local, t18_600 (write / read, mejor de 3) ===
+tchunk   chunks   write    read     MB      identical
+whole      1      3.37s    1.53s    335.8   True
+   94     16      1.31s    0.40s    335.8   True
+  188      8      1.36s    0.45s    335.8   True
+  256      6      1.50s    0.52s    335.8   True
+  376      4      1.64s    0.61s    335.8   True
+  752      2      2.33s    0.92s    335.8   True
+El tamano comprimido es identico al byte en los seis layouts: blosc ya comprime por
+bloques, asi que cortar el eje temporal no cuesta nada. Monotono en las dos columnas.
+
+=== linea base de la misma maquina ===
+home NFS, chunk entero, t18_600: 5.16 s   (el "2,5 s" de docs/21 §8.14 es de otra corrida)
+disco local, tchunk 128: 0.49 s
+
+=== compuerta de la escritura interrumpida ===
+store en S3 al que se le borran los atributos (como si el build muriera antes del put
+final de atributos): _zarr_read devuelve None. La marca de completitud reemplaza al
+rename, que S3 no tiene.

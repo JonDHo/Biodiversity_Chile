@@ -228,10 +228,28 @@ def _cache_write(root: str, tile: dict, cfg: TileConfig, da) -> None:
 #: written once by a separate pass and read by every run after. See `docs/24`.
 TILE_ZARR_ENV = "BIODIV_TILE_ZARR"
 
+#: Dates per time chunk. The Fase 0 stores held the whole time axis as one chunk, which reads
+#: and writes as one large object; splitting it is **strictly** better, and it is free because
+#: blosc already compresses in blocks internally -- the compressed store came out identical to
+#: the byte at every layout tried (335,8 MB on t18_600, `logs/bench_zarr_s3.log`). Measured on
+#: local disk, write / read: whole 3,37 / 1,53 s, 188 dates 1,36 / 0,45, 94 dates 1,31 / 0,40.
+#: From S3 the same tile reads in 3,1 s against 4,1 s for the single chunk. 128 sits between
+#: the two best measured points and keeps a chunk near 28 MB compressed, well above the ~10 MB
+#: floor under which a store on S3 turns into an object-listing problem (`docs/24` sec. 3).
+_ZARR_TCHUNK = 128
 
-def _zarr_path(root: str, tile: dict, cfg: TileConfig) -> Path:
+
+def _zarr_path(root: str, tile: dict, cfg: TileConfig):
+    """One tile's store: a local `Path`, or an ``s3://`` URI string if `root` is one.
+
+    Both are handed to `zarr.open_group` as a string; the two types are kept apart only so
+    the local path can still be stat-ed and renamed, neither of which S3 has.
+    """
     span = f"{cfg.years[0] - 2}_{cfg.years[-1]}"
-    return Path(root) / f"v{_CACHE_VERSION}_{tile['tile_id']}_{cfg.resolution}m_{span}.zarr"
+    name = f"v{_CACHE_VERSION}_{tile['tile_id']}_{cfg.resolution}m_{span}.zarr"
+    if root.startswith("s3://"):
+        return f"{root.rstrip('/')}/{name}"
+    return Path(root) / name
 
 
 def _zarr_read(root: str, tile: dict, cfg: TileConfig):
@@ -247,7 +265,7 @@ def _zarr_read(root: str, tile: dict, cfg: TileConfig):
     be picked up by a same-named tile -- same guard as `_cache_read`.
     """
     p = _zarr_path(root, tile, cfg)
-    if not p.exists():
+    if isinstance(p, Path) and not p.exists():
         return None
     try:
         import xarray as xr
@@ -267,14 +285,17 @@ def _zarr_read(root: str, tile: dict, cfg: TileConfig):
                         dims=("time", "y", "x"), name="kndvi")
 
 
-def zarr_write(root: str, tile: dict, cfg: TileConfig, da, clevel: int = 5) -> Path:
-    """Materialise one tile's kNDVI as a Zarr store. Returns the path.
+def zarr_write(root: str, tile: dict, cfg: TileConfig, da, clevel: int = 5,
+               tchunk: int = _ZARR_TCHUNK):
+    """Materialise one tile's kNDVI as a Zarr store. Returns its `Path` or ``s3://`` URI.
 
-    Chunked along the **whole** time axis with the tile as one spatial block, because the
+    The tile is one spatial block and the time axis is cut into `tchunk` blocks, because the
     access pattern is "the entire time series of a spatial region" -- the year loop slices
     time, never space. Measured on t18_600: neither the zstd level nor the spatial chunking
-    changes the size by more than ~2 % (`logs/bench_zarr.log`), so this picks the layout that
-    reads in one shot rather than the one that compresses best.
+    changes the size by more than ~2 % (`logs/bench_zarr.log`), so there is nothing to win by
+    compressing harder and the layout is chosen for how it reads. ``tchunk=0`` writes the time
+    axis as a single chunk, which is what the Fase 0 stores did; `_ZARR_TCHUNK` says why the
+    default no longer does.
 
     One store per tile, so a tile can never straddle another tile's chunk and resumability is
     just "does this store exist" -- the same check `scripts/argo/tile_progress.py` already
@@ -289,22 +310,38 @@ def zarr_write(root: str, tile: dict, cfg: TileConfig, da, clevel: int = 5) -> P
         from numcodecs import Blosc
         comp = {"compressor": Blosc(cname="zstd", clevel=clevel, shuffle=Blosc.SHUFFLE)}
 
-    p = _zarr_path(root, tile, cfg)
-    tmp = p.with_name(p.name + f".part{os.getpid()}")
-    shutil.rmtree(tmp, ignore_errors=True)
     v = np.asarray(da.values, np.float32)
     t = np.asarray(da.time.values).astype("datetime64[ns]").view(np.int64)
-    try:
-        g = zarr.open_group(str(tmp), mode="w")
-        g.create_array("values", shape=v.shape, chunks=v.shape, dtype="float32", **comp)
+    chunks = (tchunk if tchunk else v.shape[0], v.shape[1], v.shape[2])
+    attrs = {"bbox": [tile["xmin"], tile["ymin"], tile["xmax"], tile["ymax"]],
+             "resolution": cfg.resolution, "version": _CACHE_VERSION}
+
+    def fill(target: str) -> None:
+        g = zarr.open_group(target, mode="w")
+        g.create_array("values", shape=v.shape, chunks=chunks, dtype="float32", **comp)
         g["values"][:] = v
         for name, arr in (("times", t), ("x", np.asarray(da.x.values)),
                           ("y", np.asarray(da.y.values))):
             g.create_array(name, shape=arr.shape, chunks=arr.shape, dtype=arr.dtype)
             g[name][:] = arr
-        g.attrs["bbox"] = [tile["xmin"], tile["ymin"], tile["xmax"], tile["ymax"]]
-        g.attrs["resolution"] = cfg.resolution
-        g.attrs["version"] = _CACHE_VERSION
+        # Last, and in one shot. `_zarr_read` gates on `bbox`, so a store whose attributes
+        # are missing reads as a miss -- which is what makes this the completion marker.
+        g.attrs.put(attrs)
+
+    p = _zarr_path(root, tile, cfg)
+    if not isinstance(p, Path):
+        # S3 has no rename, so the local trick of building under a `.part` name and moving it
+        # into place is unavailable. The completion marker takes its place: the chunks are
+        # written first and the attributes last, in a single atomic PUT of the group
+        # metadata, so an interrupted write leaves a store that reads as a miss rather than
+        # one that reads as short. `mode="w"` clears whatever such an attempt left behind.
+        fill(p)
+        return p
+
+    tmp = p.with_name(p.name + f".part{os.getpid()}")
+    shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        fill(str(tmp))
         shutil.rmtree(p, ignore_errors=True)
         tmp.replace(p)                       # atomic: a half-written store is never read
     except Exception:                                               # noqa: BLE001
