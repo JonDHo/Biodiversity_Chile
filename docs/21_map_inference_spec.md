@@ -1006,3 +1006,24 @@ arquitectura, y **da vuelta la conclusión de `docs/24` §S2.3**: ver `docs/24` 
 Para la corrida completa, 5.769 teselas de 27 años desde el cubo: **~99 horas-núcleo y ~24
 horas-GPU**, contra ~1.840 horas-núcleo en CPU. La fase de inferencia deja de ser un problema de
 flota y pasa a ser **un nodo G4 chico corriendo alrededor de un día**.
+
+#### Lo que esta medición **no** cubre, dicho explícitamente
+
+1. **Leer el cubo desde S3.** Todo lo de arriba lee stores en **disco local**. `maptask.zarr_write`
+   y `_zarr_read` toman un `Path` local y nada más — el escritor de GeoTIFF sí entiende `s3://`,
+   el cubo no. O sea que falta implementarlo *y* medirlo: es la última incógnita técnica de
+   `docs/24` §7 (paso 6b), y es la única razón por la que las cifras de la corrida completa son
+   una extrapolación y no una medición.
+2. **`scripts/74` no se volvió a correr para la GPU, y no habría servido.** No tiene `--device`:
+   compara el camino de inferencia contra el de entrenamiento, siempre en CPU. Correrlo habría
+   validado la rama de CPU y no habría dicho nada sobre CUDA. La compuerta real de la GPU es el
+   diff de rásters con tolerancia declarada, y esa sí se corrió.
+3. **El micro-benchmark sobreestima el forward ~19 % por píxel** contra la corrida real: 52,0 s
+   para 46.553 px (1,12 ms/px) contra 0,90 ms/px medidos en años-tesela de producción. La entrada
+   sintética es ruido uniforme y las curvas reales no lo son. Las cifras de tesela y de año-tesela
+   —que son las que deciden— vienen de la corrida real; las que se derivan del micro-benchmark
+   (los ~15 s-GPU por tesela de 27 años, y con ellos el ciclo de trabajo de la GPU) son por lo
+   tanto una **cota superior**, y el número real de procesos por T4 puede ser algo mayor que la
+   rodilla de 4-6 medida.
+4. **Una sola GPU y un solo modelo de GPU.** No se probó G5 ni nada más grande, a propósito: con
+   el forward en 0,56 s por año-tesela no hay caso que hacer (§6 de `docs/24`).
