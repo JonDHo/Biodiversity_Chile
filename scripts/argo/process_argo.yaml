@@ -2,7 +2,7 @@
 # still missing from S3.
 #
 #   argo submit -n easi-workflows-argo scripts/argo/process_argo.yaml \
-#     -p limit-tiles=50 -p num-chunks=10
+#     -p limit-tiles=90 -p num-chunks=5
 #
 # DAG: check-access (S3 credential smoke test) -> list-missing (S3 vs. the
 # tile list) -> split-tiles (into per-pod chunks) -> process-chunk (fan-out,
@@ -57,10 +57,31 @@
 #                a -p parameter
 #
 # chunk-deadline-seconds is per POD, so it has to cover (tiles per pod) x
-# (minutes per tile), not one tile. Measured: ~15-17 min per tile x 27
-# years. 50 tiles / 10 chunks = 5 tiles per pod ~= 80 min, inside the 7200 s
-# below. 50/5 (10 tiles per pod, ~150 min) does NOT fit and the pods get
-# killed at the deadline -- that was the sizing of the 2026-09-08 run.
+# (minutes per tile), not one tile.
+#
+# The pod runs --jobs 6: six single-threaded processes, one whole tile each,
+# inside the pod's 7 cores. It used to run --jobs 1, which left six of the
+# seven cores idle -- the load is GIL-capped at ~0.7 of a core (GDAL holds it
+# while parsing COG headers) and torch thread efficiency falls to 63 % at four
+# threads, so neither half of a tile can use a whole pod on its own. Measured
+# on the 7-core Jupyter pod, 7 tiles x 3 years: --jobs 4 gives 27.4 tiles/h,
+# --jobs 7 gives 42.6 tiles/h -- 1.75x the processes buying 1.56x the work,
+# 89 % scaling efficiency, peak 1.24 GB per process on that 400-date span --
+# about 1.8 GB at the production 1998-2026 span, since `obs` grows with dates,
+# so six processes need ~11 GB of the pod's 30 Gi. 6 rather than 7 leaves a
+# core of slack: limit == request here, so at exactly-quota utilisation CFS
+# throttling stalls the whole cgroup, which costs more than the one core does.
+# Check /sys/fs/cgroup/cpu.stat (nr_throttled) on a real chunk before raising
+# it to 7.
+#
+# Tiles per pod should therefore be a MULTIPLE OF 6, or the last round runs
+# with idle processes. At ~32 min per tile per process (27 years), a round of
+# six takes ~32 min, so three rounds = 18 tiles ~= 96 min, inside the 7200 s
+# below with ~20 % margin. 90 tiles / 5 chunks = 18 per pod is the default.
+# Four rounds (24 tiles, ~128 min) does NOT fit and the pods would be killed at
+# the deadline. The 2026-09-08 run hit that wall on the old --jobs 1 sizing --
+# 50 tiles / 5 chunks, 10 tiles per pod, ~150 min -- which is the same failure
+# in different arithmetic: size the chunk to the deadline, not to the tile.
 #
 # Dedup: no separate progress tracker. list-missing runs
 # scripts/argo/tile_progress.py, which lists what is actually in S3 and only
@@ -130,9 +151,9 @@ spec:
     - name: tag
       value: argo-test1
     - name: limit-tiles
-      value: '50'
+      value: '90'
     - name: num-chunks
-      value: '10'
+      value: '5'
     - name: chunk-deadline-seconds
       value: '7200'
   artifactGC:
@@ -362,7 +383,9 @@ spec:
           --out /work/out \
           --resume \
           --workers 0 \
-          --jobs 1 \
+          --jobs 6 \
+          --load-threads 2 \
+          --torch-threads 1 \
           --device cpu \
           --tag "{{workflow.parameters.tag}}-{{inputs.parameters.chunk-id}}" || rc=$?
         # Post-mortem evidence. manifest.csv is the only per-(tile, year)
