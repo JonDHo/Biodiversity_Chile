@@ -886,3 +886,123 @@ no son comparables con §8.4, que se midió en workers de gateway de 2 núcleos.
 **Tamaño:** 325,9 MB para las 1.504 fechas de este tramo, 2,05x de compresión — consistente con
 el 2,1x medido aparte. Al tramo de producción son ~392 MB por tesela y **~2,3 TB** para las 5.769,
 más del doble de lo que `docs/24` estimaba antes de medirlo.
+
+### 8.15 La GPU sí es la palanca grande, y la más barata que se alquila alcanza (medido 2026-09-10)
+
+`docs/24` §6 dejó planteada la prueba de GPU como independiente del cubo y con una expectativa
+declarada. Se corrió sobre un nodo **Tesla T4 (15 GB), 8 vCPU, 30 GB, torch 2.12+cu130**, con
+cuatro teselas —t17_599, t17_600, t18_599, t18_600— materializadas primero como Zarr, de modo
+que lo único que separa a las dos ramas es el dispositivo. Harness:
+`scripts/bench/bench_forward_gpu.py`; log en `logs/bench_gpu.log`.
+
+#### El forward solo: 91x, y por razones que no eran las previstas
+
+46.553 px —la mediana de píxeles predichos por año-tesela—, 5 semillas, mejor de 3:
+
+| arm | s | vs CPU 1 hilo |
+|---|---:|---:|
+| CPU bucle, 1 hilo | 51,39 | 1,00x |
+| CPU bucle, 4 hilos | 18,16 | 2,83x |
+| **CUDA bucle, batch 8.192** | **0,564** | **91x** |
+| CUDA bucle, batch 32.768 / 131.072 | 0,561 / 0,562 | 91x |
+| CUDA bucle, datos residentes (sin PCIe) | 0,535 | 96x |
+| CUDA agrupado (arm C de §8.13) | 2,34 | 22x |
+| CUDA bucle + CUDA graph | 0,570 | 90x |
+
+**Las dos predicciones de `docs/24` §6 sobre el *cómo* eran falsas, y en la dirección cómoda:**
+
+1. **No está limitado por lanzamiento de kernels.** El tamaño de batch no mueve nada (8k a 128k
+   cae dentro del ruido) y capturar el batch entero como CUDA graph —que colapsa ~100
+   lanzamientos en un replay— **no compra nada**. A batch 8.192 cada kernel ya dura lo suficiente
+   como para tapar su propio lanzamiento. O sea que no hay que subir el batch ni agrupar entre
+   teselas: el `--batch 8192` de producción ya está bien.
+2. **Agrupar pierde también en GPU, y peor.** §8.13 midió `GroupedTrunk` en 0,96x sobre CPU; en
+   la T4 da **0,24x**. La idea queda cerrada en los dos dispositivos.
+3. PCIe es ~5 % (0,564 contra 0,535 residente), así que no hay caso para mantener teselas
+   residentes ni para armar staging.
+
+#### La tesela entera, que es lo que decide
+
+t18_600, años 2005/2015/2024, leyendo del Zarr, nodo tranquilo:
+
+| | `--torch-threads 1` (lo que pinnea Argo) | `--torch-threads 4` |
+|---|---:|---:|
+| CPU | 141,2 s | 60,8 s |
+| **GPU** | **11,0 s** | **10,8 s** |
+
+**La GPU es indiferente a los hilos de torch**, y eso es el resultado, no un detalle: una vez que
+el forward se va del CPU no queda nada para que esos hilos hagan. Por año-tesela, en régimen
+—descartando el primer año, que carga las tablas de smearing y el contexto CUDA—:
+
+| año-tesela | CPU 1 hilo | GPU | |
+|---|---:|---:|---|
+| 2015 (52.959 px) | 49,70 s | 2,40 s | |
+| 2024 (43.064 px) | 37,60 s | 1,80 s | |
+| por píxel | ~0,90 ms | ~44 µs | **~21x** |
+
+El residuo no-forward resulta **mucho más chico de lo que decía §8.7**: si el trabajo que no es
+forward fuera el 23 % de un año-tesela de CPU, el año de GPU no podría bajar de ~4,2 s, y baja a
+1,8 s. Sobre este nodo el forward es **~95 % del año-tesela**, no el 77 %. Extrapolando a 27 años
+en este mismo hardware (§8.6):
+
+| tesela de 27 años, desde el Zarr | CPU 1 hilo | GPU |
+|---|---:|---:|
+| carga | 2 s | 2 s |
+| arranque (tablas de smearing, contexto CUDA) | ~12 s | ~5 s |
+| 27 × año-tesela | ~1.134 s | ~55 s |
+| **total** | **~1.148 s** | **~62 s** |
+
+#### La compuerta, con la tolerancia declarada antes de mirar
+
+La tolerancia se fijó **antes** de correr el diff, como pide `docs/24` §6: por banda,
+`max|Δ| ≤ 1e-4 × (p99 − p1)` de esa banda —una fracción de su propio rango dinámico, porque las
+diez bandas difieren en órdenes de magnitud y un solo número absoluto sería vacío para unas e
+imposible para otras—, y el **patrón de NaN exacto**, que no se tolera nunca: sale de la máscara
+y del chequeo de finitud, que son lógica y no punto flotante. Implementada como `--tol-range` en
+`scripts/bench/diff_rasters.py`.
+
+**4 teselas × 3 años = 12 rásters × 10 bandas: PASA**, peor caso **5,85e-6 del rango** (1,53e-5
+absoluto), o sea 17x adentro. Nueve de cada diez bandas son **bit a bit idénticas** —las de
+máscara y conteo, que nunca tocan la GPU— y el manifiesto es idéntico, incluido `n_pred` por año
+(46.553 / 52.959 / 43.064). La GPU no cambió la *pertenencia* de ningún píxel, sólo los bits
+bajos de su valor. LCBD, que §8.13 marcaba como el canal peligroso (Yeo-Johnson λ ≈ −4.200), es
+la banda **mejor** portada, 2,9e-11 absoluto: el clip al rango de entrenamiento la acota antes de
+la inversa dura.
+
+#### Cuántos procesos por GPU, que es la pregunta que §6 no podía responder
+
+`docs/24` §6 temía que `--jobs N --device cuda` fuera un desastre: N contextos CUDA de cientos de
+MB repartiéndose una GPU por time-slicing. Medido sobre las cuatro teselas:
+
+| | s por tesela | VRAM pico | teselas/s agregadas |
+|---|---:|---:|---:|
+| 1 proceso | 11,0 | ~640 MiB | 0,091 |
+| **4 procesos** | **10,5 – 12,7** | 2.547 MiB | **0,348** |
+| 8 procesos | 17,3 – 21,2 | 5.094 MiB | 0,414 |
+| CPU, 4 procesos, 1 hilo | 87,8 – 164,6 | — | 0,033 |
+
+**El miedo era infundado y el límite es otro.** Cuatro procesos comparten la T4 **sin degradarse**
+(10,5–12,7 s contra 11,0 s en solitario), y la VRAM es ~640 MiB por contexto, así que entrarían
+~24 en la tarjeta. Pero pasar de 4 a 8 procesos casi duplica el tiempo por tesela y compra sólo
+**+19 % de throughput**: entre 4 y 6 procesos por T4 está la rodilla. Como cada proceso quiere
+~1 vCPU para el residuo, la máquina que calza es **una GPU chica con 4–8 vCPU** —forma
+`g4dn.xlarge`/`2xlarge`—, no un nodo grande y mucho menos uno multi-GPU: sobre el mismo nodo de
+8 vCPU la rama GPU rinde **~10x las teselas por hora** que la de CPU.
+
+#### Qué compra, y qué máquina conviene
+
+El costo por tesela es el precio por vCPU-hora del nodo por los segundos-núcleo que necesita, así
+que la GPU conviene mientras `p_gpu/p_cpu` sea menor que la razón de segundos-núcleo:
+
+| pasada | CPU | GPU | razón de precio de equilibrio |
+|---|---:|---:|---:|
+| **desde el Zarr** (toda corrida posterior) | ~1.148 s | ~62 s | **~18x** |
+| **primera pasada, todavía leyendo COGs** | ~1.762 s | ~676 s | **~2,6x** |
+
+Las formas G4 de una sola GPU salen ~1,3–1,4x un M7i equivalente por vCPU, así que **conviene en
+las dos** — pero de manera abrumadora sólo en la primera fila. Eso es lo que decide la
+arquitectura, y **da vuelta la conclusión de `docs/24` §S2.3**: ver `docs/24` §3.
+
+Para la corrida completa, 5.769 teselas de 27 años desde el cubo: **~99 horas-núcleo y ~24
+horas-GPU**, contra ~1.840 horas-núcleo en CPU. La fase de inferencia deja de ser un problema de
+flota y pasa a ser **un nodo G4 chico corriendo alrededor de un día**.

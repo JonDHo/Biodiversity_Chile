@@ -34,6 +34,11 @@ def main() -> None:
     ap.add_argument("--from-cache", type=Path)
     ap.add_argument("--from-dc", action="store_true")
     ap.add_argument("--resolution", type=int, default=30)
+    ap.add_argument("--load-threads", type=int, default=4, dest="load_threads",
+                    help="dask threaded-scheduler threads for the `--from-dc` load. The "
+                         "`TileConfig` default is 0, which is the synchronous path and costs "
+                         "~1,900 s a tile; `scripts/73` defaults to 4, the measured knee "
+                         "(docs/21 section 8.1). Ignored by `--from-cache`.")
     ap.add_argument("--clevel", type=int, default=5)
     a = ap.parse_args()
     if bool(a.from_cache) == bool(a.from_dc):
@@ -42,7 +47,8 @@ def main() -> None:
     from biodiv import maptask as mt
 
     years = [int(v) for v in a.years.split(",")]
-    cfg = mt.TileConfig(years=years, dest="", tags={}, resolution=a.resolution)
+    cfg = mt.TileConfig(years=years, dest="", tags={}, resolution=a.resolution,
+                        load_threads=a.load_threads)
     a.out.mkdir(parents=True, exist_ok=True)
 
     dc = None

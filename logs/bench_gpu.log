@@ -1,0 +1,53 @@
+=== node ===
+Tesla T4, 15360 MiB, 580.159.03
+vCPU 8, RAM 30 GB, torch 2.12.0+cu130
+
+=== forward micro-benchmark (scripts/bench/bench_forward_gpu.py --n 46553 --repeat 3) ===
+Tesla T4, torch 2.12.0+cu130, cuda 13.0
+n=46,553 px, 5 seeds, 16 context features, best of 3
+
+  arm                                                   s  vs cpu1         px/s    max abs
+  cpu loop, 1 thread(s), batch 8192                52.015    1.00x          895   0.00e+00
+  cpu loop, 4 thread(s), batch 8192                18.799    2.77x        2,476   0.00e+00
+  cuda loop, batch 8,192                            0.566   91.97x       82,311   1.19e-06
+  cuda grouped, batch 8,192                         2.341   22.22x       19,887   1.19e-06
+  cuda loop, resident, batch 8,192                  0.535   97.17x       86,967   1.19e-06
+  cuda grouped, resident, batch 8,192               2.315   22.47x       20,113   1.19e-06
+  cuda loop, batch 32,768                           0.563   92.47x       82,758   1.19e-06
+  cuda grouped, batch 32,768                        2.344   22.20x       19,865   1.19e-06
+  cuda loop, resident, batch 32,768                 0.539   96.58x       86,443   1.19e-06
+  cuda grouped, resident, batch 32,768              2.320   22.42x       20,063   1.19e-06
+  cuda loop, batch 131,072                          0.564   92.23x       82,547   1.19e-06
+  cuda grouped, batch 131,072                       2.344   22.19x       19,858   1.19e-06
+  cuda loop, resident, batch 131,072                0.540   96.39x       86,271   1.19e-06
+  cuda grouped, resident, batch 131,072             2.322   22.40x       20,045   1.19e-06
+  cuda loop, CUDA graph, resident, batch 8,192      0.573   90.78x       81,246   1.19e-06
+  cuda loop, CUDA graph, resident, batch 32,768     0.763   68.20x       61,042   1.19e-06
+
+reference for 'max abs' is the cpu arm; cross-device float32 is not bit-identical by construction (docs/24 section 6)
+
+=== cube build (scripts/bench/build_tile_zarr.py --from-dc) ===
+t17_599: (1487, 333, 333) from dc.load in 614.2s -> 297.5 MB (2.22x) in 3.3s  v1_t17_599_30m_2003_2024.zarr
+t17_600: (1482, 333, 333) from dc.load in 622.1s -> 272.3 MB (2.41x) in 2.8s  v1_t17_600_30m_2003_2024.zarr
+t18_599: (1504, 333, 333) from dc.load in 606.5s -> 333.9 MB (2.00x) in 2.8s  v1_t18_599_30m_2003_2024.zarr
+t18_600: (1504, 333, 333) from dc.load in 1740.7s -> 335.8 MB (1.99x) in 3.4s  v1_t18_600_30m_2003_2024.zarr
+  t18_600 ran with the TileConfig default load_threads=0 (the synchronous path);
+  the other three ran --load-threads 4.
+
+=== one tile (t18_600), 3 years, from the Zarr: device x torch-threads ===
+cpu_t1    total  141.2s  2005: 53.90s(46,553px)  2015: 49.70s(52,959px)  2024: 37.60s(43,064px)
+cpu_t4    total   60.8s  2005: 22.20s(46,553px)  2015: 21.70s(52,959px)  2024: 16.90s(43,064px)
+cuda_t1   total   11.0s  2005:  6.80s(46,553px)  2015:  2.40s(52,959px)  2024:  1.80s(43,064px)
+cuda_t4   total   10.8s  2005:  6.70s(46,553px)  2015:  2.30s(52,959px)  2024:  1.80s(43,064px)
+
+=== raster diff, GPU vs CPU, 4 tiles x 3 years, declared tolerance ===
+  manifest (12 rows, ignoring file/load_seconds/seconds): identical
+
+12 rasters x 10 bands checked
+VERDICT: WITHIN DECLARED TOLERANCE 1.0e-04 of each band's p99-p1 range (worst 5.85e-06 of range, 1.526e-05 absolute)
+
+=== sharing one T4 across N tile processes (4 tiles, 3 years each) ===
+  1 process             : 11.0 s/tile,                 ~640 MiB VRAM
+  4 processes  --jobs 4 : 10.5/10.9/11.9/12.7 s/tile,  2547 MiB VRAM, wall 32 s
+  8 processes           : 17.3-21.2 s/tile,            5094 MiB VRAM, wall 52 s
+  cpu --jobs 4 --torch-threads 1: 87.8/101.9/132.6/164.6 s/tile, wall 184 s

@@ -10,8 +10,16 @@ reproducible, and holding that line is what makes a diff meaningful. When a chan
 bit-identical (a GPU, a folded BatchNorm), ``--tol`` reports the worst deviation instead, and
 the tolerance is meant to be declared in advance rather than discovered here.
 
+``--tol-range`` is the same idea expressed per band instead of in absolute units, and it is the
+form a whole-raster gate wants: the ten bands are different facets whose units differ by orders
+of magnitude, so one absolute number is either vacuous for some of them or impossible for
+others. The tolerance for a band is ``FRAC * (p99 - p1)`` of that band **in A**, i.e. a fraction
+of its own dynamic range; p99/p1 rather than max/min so one clipped outlier cannot inflate the
+allowance. The NaN pattern is never tolerated: it comes from the mask and the finite-check,
+which are integer and logical, so a difference there is a bug and not rounding.
+
 Usage:
-    python scripts/bench/diff_rasters.py DIR_A DIR_B [--tol 1e-6]
+    python scripts/bench/diff_rasters.py DIR_A DIR_B [--tol 1e-6 | --tol-range 1e-4]
 """
 from __future__ import annotations
 
@@ -34,7 +42,11 @@ def main() -> int:
     ap.add_argument("b", type=Path)
     ap.add_argument("--tol", type=float, default=None,
                     help="allow this max absolute deviation instead of requiring bit-identity")
+    ap.add_argument("--tol-range", type=float, default=None, dest="tol_range",
+                    help="allow this fraction of each band's own p99-p1 range in A")
     args = ap.parse_args()
+    if args.tol is not None and args.tol_range is not None:
+        ap.error("--tol and --tol-range are two ways to say the same thing; pick one")
 
     ta = sorted(p.name for p in args.a.rglob("*.tif"))
     tb = sorted(p.name for p in args.b.rglob("*.tif"))
@@ -47,6 +59,7 @@ def main() -> int:
         return 1
 
     worst, bad, checked = 0.0, 0, 0
+    worst_frac = 0.0
     for name in ta:
         pa = next(args.a.rglob(name))
         pb = next(args.b.rglob(name))
@@ -64,11 +77,21 @@ def main() -> int:
             d = np.abs(np.nan_to_num(va[i]) - np.nan_to_num(vb[i]))
             nan_mismatch = int((np.isnan(va[i]) != np.isnan(vb[i])).sum())
             worst = max(worst, float(d.max()))
-            ok = args.tol is not None and d.max() <= args.tol and nan_mismatch == 0
+            allow, frac = args.tol, None
+            if args.tol_range is not None:
+                fin = va[i][np.isfinite(va[i])]
+                span = float(np.percentile(fin, 99) - np.percentile(fin, 1)) if fin.size else 0.0
+                allow = args.tol_range * span
+                frac = float(d.max() / span) if span > 0 else float("inf")
+                worst_frac = max(worst_frac, frac)
+            ok = allow is not None and d.max() <= allow and nan_mismatch == 0
+            note = f", {frac:.2e} of p99-p1 range" if frac is not None else ""
             if not ok:
                 bad += 1
-                print(f"  DIFF {name} [{label}]: max abs {d.max():.3e}, "
+                print(f"  DIFF {name} [{label}]: max abs {d.max():.3e}{note}, "
                       f"cells {int((d > 0).sum()):,}, NaN-pattern mismatches {nan_mismatch:,}")
+            elif frac is not None and d.max() > 0:
+                print(f"  ok   {name} [{label}]: max abs {d.max():.3e}{note}")
 
     # The manifest carries n_pred and per-year status: a change that left every pixel alone
     # but altered which years ran would pass the raster check and fail here.
@@ -100,10 +123,15 @@ def main() -> int:
 
     print(f"\n{len(ta)} rasters x {checked // len(ta)} bands checked")
     if bad == 0:
-        print("VERDICT: ALL BIT-IDENTICAL" if args.tol is None else
-              f"VERDICT: WITHIN TOLERANCE {args.tol:.1e} (worst {worst:.3e})")
+        if args.tol_range is not None:
+            print(f"VERDICT: WITHIN DECLARED TOLERANCE {args.tol_range:.1e} of each band's "
+                  f"p99-p1 range (worst {worst_frac:.2e} of range, {worst:.3e} absolute)")
+        else:
+            print("VERDICT: ALL BIT-IDENTICAL" if args.tol is None else
+                  f"VERDICT: WITHIN TOLERANCE {args.tol:.1e} (worst {worst:.3e})")
         return 0
-    print(f"VERDICT: {bad} MISMATCHES (worst abs {worst:.3e})")
+    print(f"VERDICT: {bad} MISMATCHES (worst abs {worst:.3e}"
+          + (f", {worst_frac:.2e} of range)" if args.tol_range is not None else ")"))
     return 1
 
 

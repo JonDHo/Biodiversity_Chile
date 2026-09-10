@@ -1,9 +1,11 @@
 # Cubo kNDVI materializado: plan de prueba y de escalado
 
-**Estado: no empezado. No hay código escrito.** Este documento es un plan y sus números son,
-salvo donde se diga lo contrario, *derivados* de las mediciones de `docs/21` §8, no medidos
-sobre un cubo Zarr que todavía no existe. La Fase 0 existe justamente para reemplazar esas
-derivaciones por mediciones.
+**Estado (2026-09-10): la Fase 0 pasó y la prueba de GPU también.** Lo que era un plan con
+números derivados ya está medido: el cubo reproduce `dc.load` bit a bit y borra la carga (§3,
+`docs/21` §8.14), y la GPU corre el forward 91x más rápido con los rásters dentro de la
+tolerancia declarada (§6, `docs/21` §8.15). Las dos mediciones juntas cambian la arquitectura
+elegida: **una pasada de construcción sola, después toda la inferencia contra el cubo en un nodo
+G4 chico** — ver §3 y §7. Donde un número siga siendo derivado y no medido, se dice.
 
 ## 1. Qué se propone
 
@@ -204,12 +206,39 @@ misma tesela:
 compra nada porque el arreglo no es muy comprimible de entrada (2x, §2), así que apretarlo más
 es gastar CPU por gastarla.
 
-**Y eso decide la arquitectura.** Construir el cubo como job aparte —las Opciones A, B y C de
-§5— paga una fase de carga completa, ~1.766 horas-proceso, sólo para construirlo. Construirlo
-con `--write-cube` cuesta **~0,6 % extra** sobre una corrida que va a ocurrir de todos modos. La
-segunda domina a la primera sin discusión, y **la elección entre A, B y C queda sin objeto**: es
-un flag, no un job. Las tres opciones quedan abajo como registro de por qué se descartaron, no
-como alternativas vivas.
+**Eso parecía decidir la arquitectura, y la GPU lo dio vuelta (2026-09-10).** El argumento era:
+construir el cubo como job aparte paga una fase de carga completa sólo para construirlo, mientras
+que `--write-cube` cuesta ~0,6 % extra sobre una corrida que va a ocurrir igual. **Es correcto
+mientras el forward corra en la misma CPU que hizo la carga.** Deja de serlo cuando el forward se
+va a una GPU (§6, `docs/21` §8.15), porque entonces las dos fases quieren máquinas de precio muy
+distinto — que es la misma tensión de §4, ahora con una diferencia de precio y no sólo de forma.
+
+Por tesela, en segundos-núcleo de 27 años:
+
+| | carga | forward | residuo | en qué nodo |
+|---|---:|---:|---:|---|
+| pasada de construcción | ~614 | — | — | spot de CPU, lo más barato que haya |
+| pasada de inferencia (desde el Zarr) | ~2 | ~15 **s-GPU** | ~47 | un nodo G4 chico |
+| *`--write-cube` empaquetado en un nodo con GPU* | ~614 | ~15 s-GPU | ~47 | **nodo GPU, 93 % de él esperando a S3** |
+
+Empaquetar significa alquilar un nodo con GPU para que se quede ~10 minutos por tesela dentro de
+la latencia de S3. Con un sobreprecio de ~1,35x eso sale **~20-25 % más caro** que separar, y no
+compra nada: la GPU está ociosa durante casi todo. Y empaquetar sobre nodos de **CPU** es
+bastante peor, porque ahí se pagan ~1.134 segundos-núcleo por tesela de forward que una GPU hace
+en 15.
+
+**Entonces: una pasada de construcción sola, y después toda la inferencia contra el cubo.** Que
+es la **Opción A** de §5, la separación en dos etapas — no "sin objeto" después de todo, sino la
+que gana, y por una razón que no estaba disponible cuando se escribió §5. Las Opciones B y C
+siguen descartadas: B pierde el intermedio con el pod, y C depende de la sonda de capacidad.
+
+La pasada de construcción, con lo medido: **5.769 × ~614 s ≈ ~984 horas-proceso** a
+`--load-threads 4` (medido: 614 s por tesela contra 1.741 s en el camino síncrono, que es el
+default de `TileConfig`; la diferencia importa y por eso `build_tile_zarr.py` expone el flag).
+No necesita GPU, ni el modelo, ni los checkpoints — por eso puede correr en el pool más barato
+que haya. Es idempotente por tesela, así que spot calza y una interrupción cuesta una tesela.
+`--write-cube` en `scripts/73` sigue siendo útil como red de seguridad si alguna corrida de
+producción sale antes que el cubo, pero ya no es la jugada principal.
 
 ## 4. La tensión de diseño: el cluster de dask estorba al procesamiento
 
@@ -310,98 +339,86 @@ No hace falta decidir ahora, y no conviene: la Fase 0 produce el número que sep
 —cuánto pesa una tesela comprimida y cuánto tarda en subir y bajar de S3—, y la sonda de
 capacidad separa C de las otras dos. El orden es Fase 0 → sonda de capacidad → elección.
 
-## 6. La GPU, que es una prueba y no una construcción
+## 6. La GPU: medida, y es la palanca grande (2026-09-10)
 
-No necesita el Zarr. `BIODIV_TILE_CACHE` ya deja una tesela con la carga en cero, y `--device`
-(`scripts/73_map_inference.py:132`), `TileConfig.device` (`src/biodiv/maptask.py:153`) y el
-argumento de dispositivo de `FacetEnsemble` ya existen. Así que la prueba es: correr
-`scripts/73` contra una tesela cacheada con `--device cuda` en una máquina con GPU, y
-compararla con la misma tesela en CPU.
+**RESUELTO. La prueba se corrió y el detalle con todas las tablas está en `docs/21` §8.15**; acá
+queda lo que decide el diseño. Nodo **Tesla T4 (15 GB), 8 vCPU**, cuatro teselas materializadas
+como Zarr primero, de modo que lo único que separa las dos ramas es el dispositivo.
 
-**Qué esperar, para no leer mal el resultado.** El modelo son 14.535 parámetros de Conv1d
-separable en profundidad con `padding_mode="circular"`: intensidad aritmética muy baja, una
-forma que las GPUs manejan mal. Lo más probable es quedar limitado por lanzamiento de kernels,
-no por FLOPs. El batch hoy es 8.192; puede hacer falta subirlo, o agrupar entre teselas, para
-mantener la GPU alimentada.
+| | resultado |
+|---|---|
+| forward solo, 46.553 px, 5 semillas | 51,4 s (CPU 1 hilo) → **0,56 s**, **91x** |
+| tesela de 3 años desde el Zarr, `--torch-threads 1` | 141,2 s → **11,0 s** |
+| año-tesela en régimen | ~0,90 ms/px → ~44 µs/px, **~21x** |
+| tesela de 27 años, extrapolada en el mismo nodo | ~1.148 s → **~62 s** |
+| compuerta de rásters, tolerancia declarada de antemano | **PASA**, peor 5,85e-6 del rango de la banda contra 1e-4 permitido |
 
-**La bit-exactitud no aplica aquí.** El orden de las operaciones de punto flotante difiere
-entre CPU y GPU, así que la diferencia de rásters de §8.8 no va a dar cero y necesita una
-**tolerancia declarada** en vez de igualdad. Conviene fijarla antes de mirar el resultado.
+**Lo que este documento predecía sobre el *cómo* era falso, y en la dirección cómoda.** No está
+limitado por lanzamiento de kernels: el tamaño de batch no mueve nada y capturarlo como CUDA
+graph no compra nada, así que **no hay que subir el batch ni agrupar entre teselas**. Agrupar las
+cinco semillas —la arm C de §8.13— pierde también en GPU, y peor que en CPU (0,24x). PCIe es ~5 %.
 
-**La regla de decisión, para no comprar por entusiasmo.** Hoy, con la carga en ~47 % de la
-tesela, Amdahl topa la GPU en **~1,7x** por tesela: acelera lo que no es el cuello. La forma
-útil de plantearlo es que una GPU no sólo hace rápida la CNN, sino que **libera a las CPU de
-hacerla**, así que el mismo número de vCPU carga ~2,1x más teselas por hora. De ahí:
+**Y el miedo de "no se puede alimentar" tampoco se sostuvo.** `--jobs 4 --device cuda` corre
+cuatro procesos sobre una sola T4 **sin degradarse** (10,5–12,7 s por tesela contra 11,0 s en
+solitario), con ~640 MiB de VRAM por contexto: entrarían ~24 en la tarjeta. Pasar a 8 procesos
+casi duplica el tiempo por tesela y compra sólo +19 %, así que la rodilla está entre **4 y 6
+procesos por T4**. No hace falta el diseño de "cargadores como workers y la GPU en el driver" que
+se proponía más abajo en esta sección: con el cubo materializado no hay nada que cargar, y
+`--jobs N --device cuda` simplemente funciona.
 
-> Una instancia con GPU conviene sólo si cuesta menos que **~2x** una instancia CPU con el
-> mismo número de vCPU.
+**La regla de compra, ahora con números.** El costo por tesela es el precio por vCPU-hora por los
+segundos-núcleo que el nodo necesita, así que la GPU conviene mientras `p_gpu/p_cpu` sea menor
+que la razón de segundos-núcleo:
 
-A precios EC2 de hoy eso suele quedar cerca del empate, así que hay que **cotizarlo en el
-momento de decidir**, no asumirlo. Lo que cambia el cálculo es exactamente lo de §2 punto 4:
-con la carga materializada el forward pasa a ~77 % de la tesela y la GPU deja de ser 1,7x para
-ser una palanca de 5x o más. Por eso el orden importa.
+| pasada | CPU | GPU | razón de equilibrio |
+|---|---:|---:|---:|
+| **desde el Zarr** (toda corrida posterior) | ~1.148 s | ~62 s | **~18x** |
+| **primera pasada, todavía leyendo COGs** | ~1.762 s | ~676 s | **~2,6x** |
 
-#### El problema no es sólo cuánto vale la GPU, es poder alimentarla
+Las formas G4 de una sola GPU salen ~1,3–1,4x un M7i equivalente por vCPU —**cotizar al momento
+de decidir, no asumir**— así que conviene en las dos, pero de manera abrumadora sólo en la
+primera fila. Eso es lo que da vuelta a §3, y está discutido ahí.
 
-Esto es más fuerte que el argumento de Amdahl de arriba, y es la razón operativa por la que la
-caché va primero.
+**Qué máquina.** Como cada proceso quiere ~1 vCPU para el residuo y la rodilla está en 4–6
+procesos por GPU, lo que calza es **una GPU chica con 4–8 vCPU** (`g4dn.xlarge`/`2xlarge`). Un
+nodo grande de una GPU deja vCPU ociosas; uno multi-GPU está sobre-equipado por un factor de
+~4. Y **G5/G6e no compran nada**: 14.535 parámetros y ~640 MiB de VRAM no llenan una tarjeta
+grande, y el término que la GPU ataca ya bajó a 55 s por tesela de 27 años.
 
-En CPU, `--jobs N` compra el solapamiento gratis: N procesos hacen carga→CNN cada uno, así que
-la espera de S3 de una tesela tapa la CNN de otra. **Eso no se traslada a una máquina con GPU**,
-porque los N procesos quieren la misma GPU. Y `fan_out` reinvoca el script como N subprocesos
-pasándole `--device` tal cual (`scripts/73_map_inference.py:628`), de modo que `--jobs 6
---device cuda` daría N contextos CUDA —cientos de MB de VRAM cada uno para un modelo de 14.535
-parámetros— repartiéndose una GPU por time-slicing. Con un trabajo limitado por lanzamiento de
-kernels, que es el nuestro, eso empeora justo lo que ya duele.
+Para la corrida completa desde el cubo: **~99 horas-núcleo y ~24 horas-GPU** contra ~1.840
+horas-núcleo en CPU. La inferencia deja de ser un problema de flota y pasa a ser un nodo G4 chico
+corriendo alrededor de un día.
 
-La forma correcta en una sola máquina es **cargadores como workers y la GPU en el driver**: dask
-(o un pool de procesos) hace sólo la carga —la parte topada por el GIL y limitada por latencia
-de S3, que sí escala con procesos— y un único proceso posee la GPU y consume teselas listas.
-Notar que acá `load_client=True` deja de ser un problema y pasa a ser lo que se quiere: computar
-al driver es correcto cuando el driver es el que tiene la GPU. Dos cuidados: **CUDA no sobrevive
-a `fork`**, así que no hay que propagar `--device cuda` a los workers —si sólo cargan, no hay
-CUDA en ningún worker y el problema no existe—; y cada cargador tiene que llamar a `dc.load`
-**sincrónicamente** dentro del worker, no armar un grafo lazy que se reenvía al scheduler que lo
-está corriendo, que es lo que costó 3.434 teselas (§8.5, §8.10).
-
-**Y acá está el aguijón.** Los cargadores tienen que producir teselas al ritmo que la GPU las
-consume. Un cargador son ~700 s de pared por tesela a ~0,72 de núcleo, así que:
-
-| tiempo de GPU por tesela | cargadores concurrentes | vCPU sólo para cargar |
-|---:|---:|---:|
-| 120 s | ~6 | ~4 |
-| 60 s | ~12 | ~8 |
-| 20 s | ~35 | ~25 |
-
-`t_gpu` no se sabe hasta que la prueba de arriba lo mida, y toda la tabla depende de él — otra
-razón para correr esa prueba antes de dimensionar nada. Pero la conclusión no depende del valor
-exacto: **sin el cubo materializado, un nodo con GPU tiene que cargar con suficiente vCPU para
-correr entre 6 y 35 cargadores de Landsat concurrentes sólo para no dejar la GPU en hambre**, es
-decir pagar precio de nodo GPU por una máquina que es sobre todo un cliente de S3.
-
-Dicho al revés, y es la formulación que ordena todo este documento: **el cubo Zarr *es* la
-separación entre carga y procesamiento**, hecha una sola vez, offline, en CPU barata, en vez de
-rehacerla adentro de cada hora-GPU. La Opción A de §5 es esa misma separación hecha por corrida
-en lugar de una sola vez.
-
-Cuándo una GPU sí sería una decisión fácil para este tipo de procesamiento, para tenerlo de
-referencia: un modelo materialmente más grande (un transformer, una U-Net sobre parches, o
-muchos más miembros de ensemble), o trabajo por píxel pesado en vez de diminuto (ajuste denso
-de series, kernels grandes, solvers iterativos). Nada de eso describe al modelo actual.
+Cuándo una GPU sería una decisión fácil para este tipo de procesamiento, para tenerlo de
+referencia: un modelo materialmente más grande (un transformer, una U-Net sobre parches, o muchos
+más miembros de ensemble), o trabajo por píxel pesado en vez de diminuto. Nada de eso describe al
+modelo actual — y sin embargo la GPU gana igual, porque el forward es ~95 % de lo que queda una
+vez que la carga está materializada.
 
 ## 7. Secuencia
 
-1. **Fase 0**, una tesela: consistencia bit a bit + fracción de NaN + tamaño comprimido +
-   escalado de lectura por hilos + alineación de chunks. Compuerta: nada sigue si falla.
-2. **Decidir `--write-cube`**: si la Fase 0 pasa, la próxima corrida de producción puede
-   construir el cubo de paso y volver innecesaria la elección de (3). Es la decisión más barata
-   de todo el plan y por eso va antes que la sonda.
-3. **Sonda de capacidad**: ¿los ~5 workers son cuota o fueron circunstancia? Sólo hace falta si
-   (2) sale que no.
-4. **Elegir A, B o C** con (1) y (3) en la mano.
-5. **Prueba de GPU** sobre una tesela cacheada, con tolerancia declarada y la regla de costo de
-   §6. Independiente de (1)-(4); se puede correr en paralelo.
-6. Construir.
+1. ~~**Fase 0**, una tesela: consistencia bit a bit + fracción de NaN + tamaño comprimido +
+   escalado de lectura por hilos + alineación de chunks.~~ **HECHO y aprobado** (`docs/21` §8.14).
+2. ~~**Decidir `--write-cube`**~~ **HECHO, y la respuesta cambió**: la construcción va como pasada
+   propia y la inferencia contra el cubo, porque separar es ~20-25 % más barato que empaquetar una
+   vez que el forward está en una GPU (§3). `--write-cube` queda como red de seguridad.
+3. ~~**Sonda de capacidad**~~ **sin objeto para esta ruta**: la inferencia ya no necesita una flota
+   —son ~24 horas-GPU y ~99 horas-núcleo— y la construcción es Argo, que es lo que ya se sabe
+   operar. Volvería a hacer falta sólo si se quisiera la Opción C para acortar la construcción.
+4. ~~**Elegir A, B o C**~~ **HECHO: Opción A**, la separación en dos etapas (§3, §5).
+5. ~~**Prueba de GPU**~~ **HECHA y pasada** (§6, `docs/21` §8.15): 91x sobre el forward, ~21x sobre
+   el año-tesela, 4 procesos por T4 sin degradarse, rásters dentro de 5,85e-6 del rango de banda
+   contra 1e-4 declarado.
+6. **Construir.** Lo que queda, en orden:
+   - **6a. La pasada de construcción**: `scripts/73` (o un job derivado de
+     `scripts/bench/build_tile_zarr.py`) sobre las 5.769 teselas, escribiendo un store por tesela
+     a S3, `--load-threads 4`, clevel 1, spot de CPU barato, reanudación por "¿existe el store?".
+     ~984 horas-proceso, ~2,3 TB, ~50 USD al mes de almacenamiento.
+   - **6b. Leer el cubo desde S3**, que es lo único de la Fase 0 que **no** está medido: todo lo
+     de acá se midió contra stores en disco local. Falta cronometrar `_zarr_read` contra un
+     prefijo `s3://` y decidir si `--jobs` alcanza para tapar esa latencia. Es la última
+     incógnita técnica y es chica.
+   - **6c. La corrida de inferencia** en un `g4dn.xlarge`/`2xlarge` con `--jobs 4`.
 
 ## Referencias
 
