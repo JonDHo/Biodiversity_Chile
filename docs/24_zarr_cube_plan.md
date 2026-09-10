@@ -187,13 +187,29 @@ dominado por el lado de la *lectura*, que es la misma carga de COGs que ya se ha
 | en un m7i.16xlarge (64 vCPU) | ~21 h; dos nodos, ~10 h; en los 5 pods de Argo a `--jobs 6`, ~2 días |
 | ancho de banda de escritura | 1 TB en 21 h ≈ **~14 MB/s agregados**. El PUT de S3 no es un problema |
 
-**Y la jugada que probablemente conviene: no construirlo como un job aparte.** La próxima
-corrida de producción ya carga cada tesela exactamente una vez. Un flag `--write-cube` en
-`scripts/73` que escriba el Zarr como efecto secundario hace que construirlo no cueste
-prácticamente nada más que el ancho de banda de escritura, entrega los mapas *y* el cubo en una
-sola pasada, y deja todas las corridas siguientes en el camino rápido. Eso convierte un job de
-21 horas en un flag. **Se decide después de la Fase 0**, no antes: si la igualdad bit a bit no
-se alcanza, este atajo escribiría 1 TB de algo que no sirve.
+**Y la jugada que conviene, ahora medida: no construirlo como un job aparte.** La próxima
+corrida de producción ya carga cada tesela exactamente una vez y ya produce mapas. Un flag
+`--write-cube` en `scripts/73` que escriba el Zarr como efecto secundario entrega los mapas *y*
+el cubo en una sola pasada. Lo que cuesta esa escritura se midió el 2026-09-11 sobre el arreglo
+real de t18_600 (1.504 fechas, 667 MB crudos), contra los **763,8 s** que cuesta la carga de esa
+misma tesela:
+
+| zstd | escribir | MB | razón | % de la carga |
+|---:|---:|---:|---:|---:|
+| **1** | **4,2 s** | 335,8 | 1,99x | **0,6 %** |
+| 3 | 7,4 s | 331,4 | 2,01x | 1,0 % |
+| 5 | 13,3 s | 325,9 | 2,05x | 1,7 % |
+
+**Nivel 1 es la elección**: 3,2x más rápido que el 5 y sólo 3 % más grande. Subir el nivel no
+compra nada porque el arreglo no es muy comprimible de entrada (2x, §2), así que apretarlo más
+es gastar CPU por gastarla.
+
+**Y eso decide la arquitectura.** Construir el cubo como job aparte —las Opciones A, B y C de
+§5— paga una fase de carga completa, ~1.766 horas-proceso, sólo para construirlo. Construirlo
+con `--write-cube` cuesta **~0,6 % extra** sobre una corrida que va a ocurrir de todos modos. La
+segunda domina a la primera sin discusión, y **la elección entre A, B y C queda sin objeto**: es
+un flag, no un job. Las tres opciones quedan abajo como registro de por qué se descartaron, no
+como alternativas vivas.
 
 ## 4. La tensión de diseño: el cluster de dask estorba al procesamiento
 

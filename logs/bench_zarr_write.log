@@ -1,0 +1,10 @@
+array (1504, 333, 333), raw 667 MB, load it replaces: 763.8 s
+
+ zstd  write s      MB  ratio  MB/s in  % of load
+    1      4.2   335.8  1.99x      159       0.6%
+    3      7.4   331.4  2.01x       90       1.0%
+    5     13.3   325.9  2.05x       50      1.7%   <- from the build run in bench_gate_zarr.log,
+                                                      not this sweep (stopped after level 3)
+
+Level 9 not measured: levels 1-5 already show compression level buys ~3 % of size for 3x the
+time, so a slower level cannot be the right answer.
