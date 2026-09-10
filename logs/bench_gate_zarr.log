@@ -1,0 +1,19 @@
+=== build ===
+t18_600: (1504, 333, 333) from cache -> 325.9 MB (2.05x)
+=== dc.load run ===
+[1/1] t18_600: load 764s, 3 years in 867s (pred px/yr median 46553)
+=== zarr run ===
+tile zarr: hit for t18_600
+[1/1] t18_600: load 2s, 3 years in 98s (pred px/yr median 46553)
+=== raster diff ===
+  manifest (3 rows, ignoring file/load_seconds/seconds): identical
+
+3 rasters x 10 bands checked
+VERDICT: ALL BIT-IDENTICAL
+=== scripts/74 ===
+PASS  scaler round trip, max rel err per target [3.00517490e-13 2.30468611e-14 1.26480569e-15 1.06117263e-15
+PASS  context rows identical (max abs diff 0.00e+00, NaN pattern equal True)
+PASS  curve1d inputs identical (max abs diff 0.00e+00, 3102 plots with a curve)
+PASS  seed-0 forward pass identical (max abs diff 0.00e+00)
+PASS  in-sample R2 on PD0/TD0 above 0.5 (no --oof-csv given: plain inverse, expect the skewed targets to sit below their block-CV scores)
+ALL PASS

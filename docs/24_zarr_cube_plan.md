@@ -119,7 +119,17 @@ dentro de un mismo proceso un caché de índice tibio escondería justo la inest
 **La identidad bit a bit sigue siendo una compuerta válida.** Harness:
 `scripts/bench/check_load_determinism.py`.
 
-**La prueba que queda, y es la única que hay que correr antes de decidir nada más:**
+**FASE 0 COMPLETA Y APROBADA (2026-09-11).** El diff de rásters está hecho: t18_600, años
+2005/2015/2024, **3 rásters × 10 bandas todas bit a bit idénticas** contra la corrida de
+`dc.load`, manifiesto idéntico en todas las columnas sustantivas, y `scripts/74` en ALL PASS.
+La carga pasó de **763,8 s a 2,5 s (306x)** y la tesela de tres años de 867 s a 98 s. El detalle
+y la extrapolación a 27 años están en `docs/21` §8.14; el código es `maptask.zarr_write` /
+`_zarr_read` detrás de `BIODIV_TILE_ZARR`, con tests de ida y vuelta en `tests/test_maptask.py`.
+
+**Entonces la compuerta ya no bloquea nada, y la decisión que sigue es §S2.3 (`--write-cube`).**
+Lo que queda abajo es el registro de cómo se hizo la prueba.
+
+**La prueba, tal como se corrió:**
 
 1. materializar **una** tesela (t18_600, que es la que tiene línea base en §6, §8.7 y §8.8);
 2. correr `scripts/73` contra el Zarr y contra `dc.load`, mismos años;

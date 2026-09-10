@@ -222,6 +222,97 @@ def _cache_write(root: str, tile: dict, cfg: TileConfig, da) -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+#: Root of the materialised kNDVI cube: one Zarr store per tile, named like the dev cache.
+#: Unset -- which is what every run leaves it today -- means `load_tile` behaves exactly as
+#: before. Unlike `BIODIV_TILE_CACHE` this is a *production* candidate, not scaffolding: it is
+#: written once by a separate pass and read by every run after. See `docs/24`.
+TILE_ZARR_ENV = "BIODIV_TILE_ZARR"
+
+
+def _zarr_path(root: str, tile: dict, cfg: TileConfig) -> Path:
+    span = f"{cfg.years[0] - 2}_{cfg.years[-1]}"
+    return Path(root) / f"v{_CACHE_VERSION}_{tile['tile_id']}_{cfg.resolution}m_{span}.zarr"
+
+
+def _zarr_read(root: str, tile: dict, cfg: TileConfig):
+    """One tile's kNDVI from the materialised cube, or None.
+
+    The arrays are read straight out of zarr rather than through `xarray.open_zarr`, and that
+    is deliberate: xarray would CF-encode ``time`` on write and decode it on read, which can
+    change datetime resolution on the round trip. That would break bit-identity with `dc.load`
+    for a reason that has nothing to do with Zarr, and bit-identity is the whole gate
+    (`docs/24` Fase 0). Storing the datetime64 as its int64 view sidesteps the question.
+
+    The geometry is re-checked against the tile, so a store written for a different grid cannot
+    be picked up by a same-named tile -- same guard as `_cache_read`.
+    """
+    p = _zarr_path(root, tile, cfg)
+    if not p.exists():
+        return None
+    try:
+        import xarray as xr
+        import zarr
+        g = zarr.open_group(str(p), mode="r")
+        if list(g.attrs.get("bbox", ())) != [tile["xmin"], tile["ymin"],
+                                             tile["xmax"], tile["ymax"]]:
+            return None
+        values = g["values"][:]
+        times = g["times"][:].view("datetime64[ns]")
+        x, y = g["x"][:], g["y"][:]
+    except Exception:                                               # noqa: BLE001
+        return None                                                 # a torn store is a miss
+    if values.shape != (len(times), len(y), len(x)):
+        return None
+    return xr.DataArray(values, coords={"time": times, "y": y, "x": x},
+                        dims=("time", "y", "x"), name="kndvi")
+
+
+def zarr_write(root: str, tile: dict, cfg: TileConfig, da, clevel: int = 5) -> Path:
+    """Materialise one tile's kNDVI as a Zarr store. Returns the path.
+
+    Chunked along the **whole** time axis with the tile as one spatial block, because the
+    access pattern is "the entire time series of a spatial region" -- the year loop slices
+    time, never space. Measured on t18_600: neither the zstd level nor the spatial chunking
+    changes the size by more than ~2 % (`logs/bench_zarr.log`), so this picks the layout that
+    reads in one shot rather than the one that compresses best.
+
+    One store per tile, so a tile can never straddle another tile's chunk and resumability is
+    just "does this store exist" -- the same check `scripts/argo/tile_progress.py` already
+    does for GeoTIFFs.
+    """
+    import zarr
+    try:
+        from zarr.codecs import BloscCodec, BloscShuffle
+        comp = {"compressors": [BloscCodec(cname="zstd", clevel=clevel,
+                                           shuffle=BloscShuffle.shuffle)]}
+    except ImportError:                                             # zarr-python 2
+        from numcodecs import Blosc
+        comp = {"compressor": Blosc(cname="zstd", clevel=clevel, shuffle=Blosc.SHUFFLE)}
+
+    p = _zarr_path(root, tile, cfg)
+    tmp = p.with_name(p.name + f".part{os.getpid()}")
+    shutil.rmtree(tmp, ignore_errors=True)
+    v = np.asarray(da.values, np.float32)
+    t = np.asarray(da.time.values).astype("datetime64[ns]").view(np.int64)
+    try:
+        g = zarr.open_group(str(tmp), mode="w")
+        g.create_array("values", shape=v.shape, chunks=v.shape, dtype="float32", **comp)
+        g["values"][:] = v
+        for name, arr in (("times", t), ("x", np.asarray(da.x.values)),
+                          ("y", np.asarray(da.y.values))):
+            g.create_array(name, shape=arr.shape, chunks=arr.shape, dtype=arr.dtype)
+            g[name][:] = arr
+        g.attrs["bbox"] = [tile["xmin"], tile["ymin"], tile["xmax"], tile["ymax"]]
+        g.attrs["resolution"] = cfg.resolution
+        g.attrs["version"] = _CACHE_VERSION
+        shutil.rmtree(p, ignore_errors=True)
+        tmp.replace(p)                       # atomic: a half-written store is never read
+    except Exception:                                               # noqa: BLE001
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    return p
+
+
 def load_tile(dc, tile: dict, cfg: TileConfig):
     """The whole archive span for one tile, computed.
 
@@ -237,6 +328,14 @@ def load_tile(dc, tile: dict, cfg: TileConfig):
     8 dask *processes* takes 304 s. So threads inside a tile are worth about 3x and no more,
     and the parallelism that actually pays is one process per tile.
     """
+    # The materialised cube first: it is the production path when it exists, and it is the
+    # cheapest of the three (measured ~1.3 s of decompression against ~700 s of COG headers).
+    zroot = os.environ.get(TILE_ZARR_ENV)
+    if zroot:
+        hit = _zarr_read(zroot, tile, cfg)
+        if hit is not None:
+            print(f"tile zarr: hit for {tile['tile_id']}", flush=True)
+            return hit
     cache = os.environ.get(TILE_CACHE_ENV)
     if cache:
         hit = _cache_read(cache, tile, cfg)

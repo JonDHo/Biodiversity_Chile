@@ -324,3 +324,56 @@ def test_load_tile_ignores_the_cache_when_the_env_var_is_unset(tmp_path, monkeyp
     monkeypatch.setattr(mt.mi, "load_kndvi", fake_load_kndvi)
     assert mt.load_tile(None, tile, cfg) is None
     assert len(calls) == 1                    # went to the cube, not to the populated cache
+
+
+def test_zarr_store_round_trips_bitwise(tmp_path):
+    """The materialised cube must return exactly what `load_tile` would have returned.
+
+    Bit-identity is the whole Fase 0 gate (`docs/24`), and the two ways it could quietly fail
+    are float precision and datetime encoding -- so this checks values with
+    ``equal_nan=True`` and the time axis for exact equality, including a same-day pair, which
+    is where a CF round trip through xarray would show up.
+    """
+    import numpy as np
+    import xarray as xr
+
+    from biodiv import maptask as mt
+
+    rng = np.random.default_rng(0)
+    v = rng.random((7, 5, 4), dtype=np.float32)
+    v[2, 1, 1] = np.nan                                    # NaN must survive as NaN
+    times = np.array(["2003-01-01", "2003-01-01", "2003-06-02", "2004-01-01",
+                      "2004-07-09", "2005-02-02", "2005-11-30"], dtype="datetime64[ns]")
+    da = xr.DataArray(v, coords={"time": times, "y": np.arange(5.0), "x": np.arange(4.0)},
+                      dims=("time", "y", "x"), name="kndvi")
+    tile = {"tile_id": "t0_0", "xmin": 0.0, "ymin": 0.0, "xmax": 120.0, "ymax": 150.0}
+    cfg = mt.TileConfig(years=[2005], resolution=30, dest="", tags={})
+
+    mt.zarr_write(str(tmp_path), tile, cfg, da)
+    got = mt._zarr_read(str(tmp_path), tile, cfg)
+
+    assert got is not None
+    assert np.array_equal(got.values, v, equal_nan=True)
+    assert np.array_equal(got.time.values, times)
+    assert np.array_equal(got.x.values, da.x.values)
+    assert np.array_equal(got.y.values, da.y.values)
+
+
+def test_zarr_store_rejects_a_different_grid(tmp_path):
+    """A store written for one bbox must not be served to a same-named tile on another."""
+    import numpy as np
+    import xarray as xr
+
+    from biodiv import maptask as mt
+
+    da = xr.DataArray(np.zeros((2, 3, 3), np.float32),
+                      coords={"time": np.array(["2003-01-01", "2004-01-01"], "datetime64[ns]"),
+                              "y": np.arange(3.0), "x": np.arange(3.0)},
+                      dims=("time", "y", "x"), name="kndvi")
+    cfg = mt.TileConfig(years=[2005], resolution=30, dest="", tags={})
+    tile = {"tile_id": "t0_0", "xmin": 0.0, "ymin": 0.0, "xmax": 90.0, "ymax": 90.0}
+    mt.zarr_write(str(tmp_path), tile, cfg, da)
+
+    moved = dict(tile, xmin=999.0, xmax=1089.0)
+    assert mt._zarr_read(str(tmp_path), moved, cfg) is None
+    assert mt._zarr_read(str(tmp_path), tile, cfg) is not None

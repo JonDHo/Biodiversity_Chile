@@ -829,3 +829,60 @@ del umbral de ~10 % de tesela con el que se está priorizando.
 **La palanca del forward es la GPU, no reestructurarlo en CPU** — y por eso el orden de
 `docs/24` importa: materializar la carga primero es lo que hace que la GPU valga la pena, y
 también lo que hace que se la pueda alimentar (`docs/24` §6).
+
+### 8.14 El cubo Zarr reproduce `dc.load` bit a bit, y borra la carga (medido 2026-09-11)
+
+La compuerta de la Fase 0 de `docs/24` pasó. Es el resultado que decide si el cubo materializado
+es viable, así que va acá con sus números y no sólo en el plan.
+
+**El camino no es arquitectura nueva: es un cambio de backend detrás de una costura que ya
+existía y ya estaba probada.** `load_tile` consulta `BIODIV_TILE_CACHE` desde §8.8 y devuelve un
+`DataArray` reconstruido de disco; `BIODIV_TILE_ZARR` se consulta antes, con la misma forma y las
+mismas guardas de geometría. `load_kndvi` ya devuelve exactamente el arreglo que hay que
+persistir —`(time, y, x)` float32, ya ordenado por tiempo—, así que Zarr sólo reemplaza al `.npy`.
+
+**Los arreglos se escriben con zarr directamente, no con `xarray.open_zarr`/`to_zarr`, y eso es
+deliberado:** xarray codifica `time` en convención CF al escribir y la decodifica al leer, lo que
+puede cambiar la resolución del datetime en el viaje de ida y vuelta. Eso rompería la identidad
+bit a bit por un motivo que no tiene nada que ver con Zarr. Guardar el `datetime64` como su vista
+`int64` esquiva la pregunta entera.
+
+#### El resultado
+
+Tesela t18_600, años 2005/2015/2024 (ventana 2003-2024, 1.504 fechas), pod de 8 núcleos,
+`--torch-threads 4`:
+
+| | `dc.load` | Zarr | |
+|---|---:|---:|---|
+| carga | **763,8 s** | **2,5 s** | **306x** |
+| tesela completa (3 años) | 867 s | **98 s** | 8,8x |
+| píxeles predichos por año (mediana) | 46.553 | 46.553 | idéntico |
+
+**Diferencia de rásters: 3 rásters × 10 bandas, TODAS BIT A BIT IDÉNTICAS**
+(`np.array_equal(equal_nan=True)`, peor absoluto 0,000e+00). El manifiesto es idéntico en todas
+las columnas sustantivas —`n_pred`, `n_native`, `n_dates_window`, `grid_first`, `grid_last`,
+`status`—; sólo difieren `seconds`, `load_seconds` y la ruta de salida, que difieren entre dos
+corridas cualesquiera por construcción. `scripts/74` en **ALL PASS**, con 0,00e+00 en contexto,
+entradas y forward.
+
+Harness: `scripts/bench/build_tile_zarr.py` y `scripts/bench/diff_rasters.py`; log en
+`logs/bench_gate_zarr.log`.
+
+#### Qué significa para el presupuesto
+
+El término por año no se mueve —es el mismo código— así que lo que cambia es sólo la carga.
+Extrapolando **en este mismo hardware**, que es la única forma válida de compararlo (§8.6):
+
+| tesela de 27 años | `dc.load` | Zarr |
+|---|---:|---:|
+| carga | 764 s | 2 s |
+| trabajo por año × 27 | ~918 s | ~918 s |
+| **total** | **~1.682 s** | **~920 s** |
+
+**1,83x por tesela**, y el forward pasa a ser ~el 77 % de lo que queda — que es exactamente el
+régimen donde una GPU deja de ser una palanca de 1,7x (`docs/24` §6). Los absolutos de esta tabla
+no son comparables con §8.4, que se midió en workers de gateway de 2 núcleos.
+
+**Tamaño:** 325,9 MB para las 1.504 fechas de este tramo, 2,05x de compresión — consistente con
+el 2,1x medido aparte. Al tramo de producción son ~392 MB por tesela y **~2,3 TB** para las 5.769,
+más del doble de lo que `docs/24` estimaba antes de medirlo.
