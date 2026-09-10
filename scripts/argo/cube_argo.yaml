@@ -1,0 +1,659 @@
+# biodiv-cube -- build the materialised kNDVI cube, then infer from it.
+#
+#   argo submit -n easi-workflows-argo scripts/argo/cube_argo.yaml \
+#     -p limit-tiles=90 -p num-chunks=5
+#
+# This is `docs/24` Option A: one construction pass on cheap CPU, then all inference against
+# the cube on a small GPU node. It is SEPARATE from process_argo.yaml, which stays as the
+# working path that reads COGs directly -- nothing here modifies it, and either can be run.
+#
+# ---------------------------------------------------------------------
+# Three entrypoints, because the two stages are worth running apart
+# ---------------------------------------------------------------------
+#   main         build everything, then infer. The default, and biphasic: infer-chunk depends
+#                on build-chunk, so NO tile is inferred until EVERY tile is built.
+#   build-only   the construction pass alone (`argo submit --entrypoint build-only`)
+#   infer-only   inference alone, against whatever the cube already holds
+#
+# **On overlapping the two.** The stages are 1-to-1 per tile, so waiting for the whole build is
+# not technically necessary, and the wall-time case for overlapping is real: total goes from
+# build+infer to max(build, infer). The ratio is what decides it. A build pod produces a tile
+# every ~360 s (27 years, --workers 7, extrapolated from the 292,2 s measured at 22 years in
+# `docs/21` 8.17); a GPU node at --jobs 4 retires one every ~17,5 s. So ONE GPU NODE NEEDS
+# ~20 BUILD PODS to stay fed. Below that ratio the GPU idles at GPU prices, which is the same
+# error `docs/24` 3 rejected when it killed the bundled --write-cube plan.
+#
+# It is deliberately not the default for the first run, and `docs/24` 5 says why: resist
+# pipelining until A has run once. Overlapping loses nothing durable -- the stores land in S3
+# either way, so re-runs stay cheap -- but it does mean a bad cube is consumed before anyone
+# can look at it, and the build pass has never run at scale. Once it has, overlapping is
+# `argo submit --entrypoint infer-only` alongside a running build, with no edit to this file:
+# cube_progress.py and tile_progress.py both answer "what is ready" by listing S3, so a polling
+# pipeline falls out of the tooling that already exists.
+#
+# ---------------------------------------------------------------------
+# What each stage costs, measured
+# ---------------------------------------------------------------------
+# build-chunk  ~360 s/tile (27 years). The scheduler is `--workers 7`, NOT the `--load-threads`
+#              that process_argo.yaml uses: that setting is tuned around the CNN competing with
+#              the cluster's workers, and this pass has no CNN. Measured 688,8 s -> 292,2 s,
+#              2,36x, rasters bit-identical between the two (`docs/21` 8.17).
+# infer-chunk  ~70 s/tile at --jobs 4 on one T4, from the cube (`docs/21` 8.15). The stores are
+#              pulled to node-local disk first by stage_cube.py: reading them there is 0,49 s a
+#              tile against 3,1 s direct from S3 (`docs/21` 8.16), which turns a ~13 % read tax
+#              into ~4 %. Staging measured 115 MB/s, ~2,7 s a tile.
+#
+# Dedup, both stages, same principle as process_argo.yaml: no separate progress tracker, S3 is
+# the source of truth. cube_progress.py treats a tile as built only when its store carries the
+# completion marker -- zarr_write writes the group attributes last, so a build killed mid-write
+# reads as absent rather than as a short tile, and gets rebuilt.
+#
+# Sizing: build-deadline-seconds must cover (tiles per pod) x ~360 s, and
+# infer-deadline-seconds (tiles per pod) x ~70 s plus the one-off staging.
+#
+# ---------------------------------------------------------------------
+# UNVERIFIED FROM OUTSIDE THE CLUSTER -- check these two before the first submit
+# ---------------------------------------------------------------------
+#  1. gpu-image and the GPU scheduling hints (nodeSelector/tolerations under infer-chunk).
+#     The CPU images here are the ones process_argo.yaml already proves; the GPU image name
+#     and the node labels are guesses and cannot be confirmed from a CPU Jupyter pod.
+#  2. That the IRSA grant covers s3-cube. Every other prefix here is under the
+#     easi-workflows-team/ path that test-s3-access.yaml verified; s3-cube is a NEW prefix
+#     under it. Run test-s3-access.yaml against it first if in doubt.
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: biodiv-cube-
+  namespace: easi-workflows-argo
+  labels:
+    name: biodiv-cube
+    owner: jlopatin
+    team: easi-workflows-team
+spec:
+  arguments:
+    parameters:
+    - name: base-image
+      value: 444488357543.dkr.ecr.us-west-2.amazonaws.com/easi-workflows-base-torch-cpu:develop.latest
+    # UNVERIFIED: the GPU counterpart of base-image. Must carry torch with CUDA.
+    - name: gpu-image
+      value: 444488357543.dkr.ecr.us-west-2.amazonaws.com/easi-workflows-base-torch-gpu:develop.latest
+    - name: aws-image
+      value: amazon/aws-cli:2.17.62
+    - name: repo-url
+      value: https://github.com/JavierLopatin/Biodiversity_Chile.git
+    - name: repo-branch
+      value: main
+    - name: git-image
+      value: registry.k8s.io/git-sync/git-sync:v4.5.0
+    - name: db-config-secret
+      value: easi-odc-v2-user-db
+    - name: s3-cube
+      value: s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/cube/chile_30m
+    - name: s3-dest
+      value: s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/maps/chile_30m_2000_2026
+    - name: s3-assets
+      value: s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/assets
+    - name: s3-mapbiomas
+      value: s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/MapBiomas
+    - name: tiles-csv-name
+      value: tiles_native_10km.csv
+    - name: years
+      value: 2000-2026
+    - name: area-m2
+      value: '900'
+    - name: tag
+      value: cube-run1
+    - name: limit-tiles
+      value: '90'
+    - name: num-chunks
+      value: '5'
+    - name: build-workers
+      value: '7'
+    - name: infer-jobs
+      value: '4'
+    - name: build-deadline-seconds
+      value: '10800'
+    - name: infer-deadline-seconds
+      value: '7200'
+  artifactGC:
+    serviceAccountName: easi-workflows-team-sa-argo
+    strategy: OnWorkflowDeletion
+  entrypoint: main
+  parallelism: 5
+  podGC:
+    strategy: OnWorkflowSuccess
+  serviceAccountName: easi-workflows-team-sa-argo
+  templates:
+
+  # ---------------- DAGs ----------------
+  - name: main
+    dag:
+      tasks:
+      - name: check-access
+        template: check-access
+      - name: list-to-build
+        template: list-to-build
+        depends: check-access
+      - name: split-build
+        template: split-tiles
+        depends: list-to-build
+        arguments:
+          artifacts:
+          - name: missing-csv
+            from: '{{tasks.list-to-build.outputs.artifacts.missing-csv}}'
+      - name: build-chunk
+        template: build-chunk
+        depends: split-build
+        withParam: '{{tasks.split-build.outputs.parameters.chunk-ids}}'
+        arguments:
+          artifacts:
+          - name: chunks
+            from: '{{tasks.split-build.outputs.artifacts.chunks}}'
+          parameters:
+          - name: chunk-id
+            value: '{{item}}'
+      # THE BARRIER. This one `depends` is what makes the run biphasic; every build-chunk pod
+      # must finish before any inference starts. Removing it is not the way to overlap -- use
+      # --entrypoint infer-only in a second submission instead, so the two stages keep their
+      # own deadlines, parallelism and retries.
+      - name: list-missing-maps
+        template: list-missing-maps
+        depends: build-chunk
+      - name: split-infer
+        template: split-tiles
+        depends: list-missing-maps
+        arguments:
+          artifacts:
+          - name: missing-csv
+            from: '{{tasks.list-missing-maps.outputs.artifacts.missing-csv}}'
+      - name: infer-chunk
+        template: infer-chunk
+        depends: split-infer
+        withParam: '{{tasks.split-infer.outputs.parameters.chunk-ids}}'
+        arguments:
+          artifacts:
+          - name: chunks
+            from: '{{tasks.split-infer.outputs.artifacts.chunks}}'
+          parameters:
+          - name: chunk-id
+            value: '{{item}}'
+
+  - name: build-only
+    dag:
+      tasks:
+      - name: check-access
+        template: check-access
+      - name: list-to-build
+        template: list-to-build
+        depends: check-access
+      - name: split-build
+        template: split-tiles
+        depends: list-to-build
+        arguments:
+          artifacts:
+          - name: missing-csv
+            from: '{{tasks.list-to-build.outputs.artifacts.missing-csv}}'
+      - name: build-chunk
+        template: build-chunk
+        depends: split-build
+        withParam: '{{tasks.split-build.outputs.parameters.chunk-ids}}'
+        arguments:
+          artifacts:
+          - name: chunks
+            from: '{{tasks.split-build.outputs.artifacts.chunks}}'
+          parameters:
+          - name: chunk-id
+            value: '{{item}}'
+
+  - name: infer-only
+    dag:
+      tasks:
+      - name: check-access
+        template: check-access
+      - name: list-missing-maps
+        template: list-missing-maps
+        depends: check-access
+      - name: split-infer
+        template: split-tiles
+        depends: list-missing-maps
+        arguments:
+          artifacts:
+          - name: missing-csv
+            from: '{{tasks.list-missing-maps.outputs.artifacts.missing-csv}}'
+      - name: infer-chunk
+        template: infer-chunk
+        depends: split-infer
+        withParam: '{{tasks.split-infer.outputs.parameters.chunk-ids}}'
+        arguments:
+          artifacts:
+          - name: chunks
+            from: '{{tasks.split-infer.outputs.artifacts.chunks}}'
+          parameters:
+          - name: chunk-id
+            value: '{{item}}'
+
+  # ---------------- steps ----------------
+  - name: check-access
+    script:
+      command: [sh]
+      image: '{{workflow.parameters.aws-image}}'
+      resources:
+        limits: {cpu: 200m, memory: 256Mi}
+        requests: {cpu: 200m, memory: 256Mi}
+      source: |
+        set -eux
+        echo "biodiv-cube {{workflow.name}}" > /tmp/preflight.txt
+        # The cube prefix is new, so it is the one this must actually prove writable.
+        aws s3 cp /tmp/preflight.txt "{{workflow.parameters.s3-cube}}/_preflight/{{workflow.name}}.txt"
+        aws s3 cp /tmp/preflight.txt "{{workflow.parameters.s3-dest}}/_preflight/{{workflow.name}}.txt"
+        aws s3 ls "{{workflow.parameters.s3-assets}}/tiles/{{workflow.parameters.tiles-csv-name}}"
+
+  - name: list-to-build
+    container:
+      image: '{{workflow.parameters.base-image}}'
+      command: [bash, -c]
+      args:
+      - |
+        python /git/repo/scripts/argo/cube_progress.py \
+          --tiles-csv "/work/assets/tiles/{{workflow.parameters.tiles-csv-name}}" \
+          --s3-cube "{{workflow.parameters.s3-cube}}" \
+          --years "{{workflow.parameters.years}}" \
+          --limit "{{workflow.parameters.limit-tiles}}" \
+          --out /work/missing_tiles.csv
+      env:
+      - name: PYTHONPATH
+        value: /git/repo/src
+      resources:
+        limits: {cpu: 1750m, memory: 3584Mi}
+        requests: {cpu: 1750m, memory: 3584Mi}
+      volumeMounts:
+      - {mountPath: /work, name: work}
+      - {mountPath: /git, name: git-data}
+    initContainers:
+    - name: git-sync
+      image: '{{workflow.parameters.git-image}}'
+      imagePullPolicy: IfNotPresent
+      command: [/bin/sh, -c]
+      args:
+      - |
+        exec /git-sync --repo="{{workflow.parameters.repo-url}}" \
+          --ref="{{workflow.parameters.repo-branch}}" \
+          --root=/git --link=repo --one-time --depth=1
+      volumeMounts:
+      - {mountPath: /git, name: git-data}
+    - name: stage-tiles
+      image: '{{workflow.parameters.aws-image}}'
+      command: [sh, -c]
+      args:
+      - |
+        set -eux
+        mkdir -p /work/assets/tiles
+        aws s3 cp "{{workflow.parameters.s3-assets}}/tiles/{{workflow.parameters.tiles-csv-name}}" /work/assets/tiles/
+      volumeMounts:
+      - {mountPath: /work, name: work}
+    outputs:
+      artifacts:
+      - name: missing-csv
+        path: /work/missing_tiles.csv
+    retryStrategy: {limit: 2, retryPolicy: OnError}
+    volumes:
+    - {name: git-data, emptyDir: {}}
+    - {name: work, emptyDir: {}}
+    archiveLocation:
+      archiveLogs: true
+      s3:
+        bucket: easido-prod-dc-data-projects
+        endpoint: s3.amazonaws.com
+        key: easi-workflows-team/biodiv/argo-artifacts/{{workflow.name}}/{{pod.name}}
+
+  - name: list-missing-maps
+    container:
+      image: '{{workflow.parameters.base-image}}'
+      command: [bash, -c]
+      args:
+      - |
+        python /git/repo/scripts/argo/tile_progress.py \
+          --tiles-csv "/work/assets/tiles/{{workflow.parameters.tiles-csv-name}}" \
+          --s3-dest "{{workflow.parameters.s3-dest}}" \
+          --years "{{workflow.parameters.years}}" \
+          --limit "{{workflow.parameters.limit-tiles}}" \
+          --out /work/missing_tiles.csv
+      env:
+      - name: PYTHONPATH
+        value: /git/repo/src
+      resources:
+        limits: {cpu: 1750m, memory: 3584Mi}
+        requests: {cpu: 1750m, memory: 3584Mi}
+      volumeMounts:
+      - {mountPath: /work, name: work}
+      - {mountPath: /git, name: git-data}
+    initContainers:
+    - name: git-sync
+      image: '{{workflow.parameters.git-image}}'
+      imagePullPolicy: IfNotPresent
+      command: [/bin/sh, -c]
+      args:
+      - |
+        exec /git-sync --repo="{{workflow.parameters.repo-url}}" \
+          --ref="{{workflow.parameters.repo-branch}}" \
+          --root=/git --link=repo --one-time --depth=1
+      volumeMounts:
+      - {mountPath: /git, name: git-data}
+    - name: stage-tiles
+      image: '{{workflow.parameters.aws-image}}'
+      command: [sh, -c]
+      args:
+      - |
+        set -eux
+        mkdir -p /work/assets/tiles
+        aws s3 cp "{{workflow.parameters.s3-assets}}/tiles/{{workflow.parameters.tiles-csv-name}}" /work/assets/tiles/
+      volumeMounts:
+      - {mountPath: /work, name: work}
+    outputs:
+      artifacts:
+      - name: missing-csv
+        path: /work/missing_tiles.csv
+    retryStrategy: {limit: 2, retryPolicy: OnError}
+    volumes:
+    - {name: git-data, emptyDir: {}}
+    - {name: work, emptyDir: {}}
+    archiveLocation:
+      archiveLogs: true
+      s3:
+        bucket: easido-prod-dc-data-projects
+        endpoint: s3.amazonaws.com
+        key: easi-workflows-team/biodiv/argo-artifacts/{{workflow.name}}/{{pod.name}}
+
+  # Shared by both stages: same input columns, same output shape.
+  - name: split-tiles
+    inputs:
+      artifacts:
+      - name: missing-csv
+        path: /work/missing_tiles.csv
+    container:
+      image: '{{workflow.parameters.base-image}}'
+      command: [python, -c]
+      args:
+      - |
+        import csv, json, math, os
+
+        rows = list(csv.reader(open("/work/missing_tiles.csv")))
+        header, rows = rows[0], rows[1:]
+        n = int(os.environ["NUM_CHUNKS"])
+        os.makedirs("/work/chunks", exist_ok=True)
+        size = math.ceil(len(rows) / n) if rows else 0
+        ids = []
+        for i in range(n):
+            part = rows[i * size:(i + 1) * size] if size else []
+            if not part:
+                continue
+            ids.append(str(i))
+            with open(f"/work/chunks/chunk_{i}.csv", "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(header)
+                w.writerows(part)
+        json.dump(ids, open("/work/chunk_ids.json", "w"))
+      env:
+      - name: NUM_CHUNKS
+        value: '{{workflow.parameters.num-chunks}}'
+      resources:
+        limits: {cpu: 500m, memory: 512Mi}
+        requests: {cpu: 500m, memory: 512Mi}
+      volumeMounts:
+      - {mountPath: /work, name: work}
+    outputs:
+      artifacts:
+      - name: chunks
+        path: /work/chunks
+      parameters:
+      - name: chunk-ids
+        valueFrom: {path: /work/chunk_ids.json}
+    volumes:
+    - {name: work, emptyDir: {}}
+    archiveLocation:
+      archiveLogs: true
+      s3:
+        bucket: easido-prod-dc-data-projects
+        endpoint: s3.amazonaws.com
+        key: easi-workflows-team/biodiv/argo-artifacts/{{workflow.name}}/{{pod.name}}
+
+  - name: build-chunk
+    activeDeadlineSeconds: '{{workflow.parameters.build-deadline-seconds}}'
+    inputs:
+      artifacts:
+      - name: chunks
+        path: /work/chunks
+      parameters:
+      - name: chunk-id
+    container:
+      image: '{{workflow.parameters.base-image}}'
+      command: [bash, -c]
+      workingDir: /git/repo
+      args:
+      - |
+        set -uo pipefail
+        rc=0
+        python scripts/75_build_cube.py \
+          --tiles-file "/work/chunks/chunk_{{inputs.parameters.chunk-id}}.csv" \
+          --cube "{{workflow.parameters.s3-cube}}" \
+          --years "{{workflow.parameters.years}}" \
+          --workers "{{workflow.parameters.build-workers}}" \
+          --resume \
+          --out /work/out \
+          --tag "{{workflow.parameters.tag}}-build-{{inputs.parameters.chunk-id}}" || rc=$?
+        # The manifest is the only per-tile record of which tiles failed and why; without this
+        # copy it dies with the pod and the stores in S3 have no provenance. Uploaded whether
+        # or not the pass succeeded -- a failed chunk is exactly when it is worth having.
+        python scripts/argo/upload_run_evidence.py /work/out \
+          "{{workflow.parameters.s3-cube}}/_runs/{{workflow.name}}/chunk-{{inputs.parameters.chunk-id}}" \
+          || echo "WARNING: run evidence was not uploaded" >&2
+        exit $rc
+      env:
+      - name: PYTHONPATH
+        value: /git/repo/src
+      - name: ODC_CONFIG_PATH
+        value: /secret/dc/.datacube.conf
+      - name: DATACUBE_CONFIG_PATH
+        value: /secret/dc/.datacube.conf
+      # usgs-landsat is requester-pays. configure_s3_access registers only a DEFAULT rio
+      # config, which does not override a rasterio.Env already active on a thread; GDAL reads
+      # these from the environment directly, so setting them here holds on every thread of
+      # every dask worker.
+      - name: AWS_REQUEST_PAYER
+        value: requester
+      - name: AWS_DEFAULT_REGION
+        value: us-west-2
+      # Scene paths come out of the ODC index already resolved, so GDAL never needs to list a
+      # directory. Off means one less round trip per band, and s3:GetObject without ListBucket.
+      - name: GDAL_DISABLE_READDIR_ON_OPEN
+        value: EMPTY_DIR
+      resources:
+        # Same shape as process_argo.yaml's pod, which is proven on this cluster. 7 cores for
+        # --workers 7; the driver holds ~820 MB per tile at 27 years (load_tile does .compute(),
+        # so the array does come back to the driver -- see docs/24 sec. 3) plus the load
+        # transient in the workers.
+        limits: {cpu: '7', memory: 30Gi}
+        requests: {cpu: '7', memory: 30Gi}
+      volumeMounts:
+      - {mountPath: /work, name: work}
+      - {mountPath: /git, name: git-data}
+      - {mountPath: /secret/dc, name: db-config}
+    initContainers:
+    - name: git-sync
+      image: '{{workflow.parameters.git-image}}'
+      imagePullPolicy: IfNotPresent
+      command: [/bin/sh, -c]
+      args:
+      - |
+        exec /git-sync --repo="{{workflow.parameters.repo-url}}" \
+          --ref="{{workflow.parameters.repo-branch}}" \
+          --root=/git --link=repo --one-time --depth=1
+      volumeMounts:
+      - {mountPath: /git, name: git-data}
+    metadata:
+      annotations:
+        karpenter.sh/do-not-disrupt: 'true'
+    outputs:
+      artifacts:
+      - name: run-evidence
+        optional: true
+        path: /work/out
+    retryStrategy: {limit: 2, retryPolicy: OnError}
+    volumes:
+    - {name: git-data, emptyDir: {}}
+    - {name: work, emptyDir: {}}
+    - name: db-config
+      secret:
+        secretName: '{{workflow.parameters.db-config-secret}}'
+        items:
+        - {key: .datacube.conf, path: .datacube.conf}
+    archiveLocation:
+      archiveLogs: true
+      s3:
+        bucket: easido-prod-dc-data-projects
+        endpoint: s3.amazonaws.com
+        key: easi-workflows-team/biodiv/argo-artifacts/{{workflow.name}}/{{pod.name}}
+
+  - name: infer-chunk
+    activeDeadlineSeconds: '{{workflow.parameters.infer-deadline-seconds}}'
+    inputs:
+      artifacts:
+      - name: chunks
+        path: /work/chunks
+      parameters:
+      - name: chunk-id
+    container:
+      image: '{{workflow.parameters.gpu-image}}'
+      command: [bash, -c]
+      workingDir: /git/repo
+      args:
+      - |
+        set -uo pipefail
+        rc=0
+        # Pull this chunk's stores to node-local disk first. Reading them there is 0,49 s a
+        # tile against 3,1 s straight from S3 (docs/21 8.16), which is worth having on a node
+        # billed at GPU rates. Without --allow-missing a tile absent from the cube fails the
+        # pod, which is what you want when the build pass is supposed to have finished.
+        python scripts/argo/stage_cube.py \
+          --tiles-file "/work/chunks/chunk_{{inputs.parameters.chunk-id}}.csv" \
+          --s3-cube "{{workflow.parameters.s3-cube}}" \
+          --years "{{workflow.parameters.years}}" \
+          --dest /scratch/cube || exit $?
+
+        python scripts/73_map_inference.py \
+          --tiles-file "/work/chunks/chunk_{{inputs.parameters.chunk-id}}.csv" \
+          --dest "{{workflow.parameters.s3-dest}}" \
+          --mapbiomas-dir "{{workflow.parameters.s3-mapbiomas}}" \
+          --ckpt-dir /work/assets/models/final \
+          --oof-csv /work/assets/models/oof_predictions.csv \
+          --derived /work/assets/derived \
+          --area-m2 "{{workflow.parameters.area-m2}}" \
+          --years "{{workflow.parameters.years}}" \
+          --out /work/out \
+          --resume \
+          --workers 0 \
+          --jobs "{{workflow.parameters.infer-jobs}}" \
+          --load-threads 0 \
+          --torch-threads 1 \
+          --device cuda \
+          --tag "{{workflow.parameters.tag}}-infer-{{inputs.parameters.chunk-id}}" || rc=$?
+        python scripts/argo/upload_run_evidence.py /work/out \
+          "{{workflow.parameters.s3-dest}}/_runs/{{workflow.name}}/chunk-{{inputs.parameters.chunk-id}}" \
+          || echo "WARNING: run evidence was not uploaded" >&2
+        exit $rc
+      env:
+      - name: PYTHONPATH
+        value: /git/repo/src
+      - name: ODC_CONFIG_PATH
+        value: /secret/dc/.datacube.conf
+      - name: DATACUBE_CONFIG_PATH
+        value: /secret/dc/.datacube.conf
+      - name: BIODIV_UNIFIED
+        value: '1'
+      - name: BIODIV_CURVES
+        value: _raw100
+      # The cube, staged locally above. load_tile consults this BEFORE dc.load, so with it set
+      # the run never opens a COG -- and --load-threads 0 above means a tile somehow missing
+      # from the cube would fall back to the slow synchronous load rather than quietly costing
+      # a normal one. stage_cube.py fails the pod first, which is the intended guard.
+      - name: BIODIV_TILE_ZARR
+        value: /scratch/cube
+      - name: AWS_DEFAULT_REGION
+        value: us-west-2
+      - name: GDAL_DISABLE_READDIR_ON_OPEN
+        value: EMPTY_DIR
+      resources:
+        # docs/21 8.15: the knee is 4-6 processes per T4, ~640 MiB of VRAM each, and each
+        # process wants ~1 vCPU for the residue -- so a small GPU with 4-8 vCPU is the shape
+        # that fits, not a large or multi-GPU node.
+        limits: {cpu: '7', memory: 30Gi, nvidia.com/gpu: 1}
+        requests: {cpu: '7', memory: 30Gi, nvidia.com/gpu: 1}
+      volumeMounts:
+      - {mountPath: /work, name: work}
+      - {mountPath: /git, name: git-data}
+      - {mountPath: /secret/dc, name: db-config}
+      - {mountPath: /scratch, name: scratch}
+    initContainers:
+    - name: git-sync
+      image: '{{workflow.parameters.git-image}}'
+      imagePullPolicy: IfNotPresent
+      command: [/bin/sh, -c]
+      args:
+      - |
+        exec /git-sync --repo="{{workflow.parameters.repo-url}}" \
+          --ref="{{workflow.parameters.repo-branch}}" \
+          --root=/git --link=repo --one-time --depth=1
+      volumeMounts:
+      - {mountPath: /git, name: git-data}
+    - name: stage-assets
+      image: '{{workflow.parameters.aws-image}}'
+      command: [sh, -c]
+      args:
+      - |
+        set -eux
+        mkdir -p /work/assets
+        aws s3 sync "{{workflow.parameters.s3-assets}}/models"  /work/assets/models
+        aws s3 sync "{{workflow.parameters.s3-assets}}/derived" /work/assets/derived
+      volumeMounts:
+      - {mountPath: /work, name: work}
+    metadata:
+      annotations:
+        karpenter.sh/do-not-disrupt: 'true'
+    # UNVERIFIED: how this cluster expresses "give me a GPU node". The nvidia.com/gpu resource
+    # above is the standard request and is usually enough with a device plugin installed; the
+    # toleration below is the common NVIDIA taint. If the cluster labels GPU nodes instead, add
+    # a nodeSelector here. Confirm before the first submit -- see the header.
+    tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+    outputs:
+      artifacts:
+      - name: run-evidence
+        optional: true
+        path: /work/out
+    retryStrategy: {limit: 2, retryPolicy: OnError}
+    volumes:
+    - {name: git-data, emptyDir: {}}
+    - {name: work, emptyDir: {}}
+    # Node-local disk for the staged cube. 18 tiles x ~392 MB at 27 years is ~7 GB; the limit
+    # is set well above that so a larger chunk does not evict the pod.
+    - name: scratch
+      emptyDir:
+        sizeLimit: 64Gi
+    - name: db-config
+      secret:
+        secretName: '{{workflow.parameters.db-config-secret}}'
+        items:
+        - {key: .datacube.conf, path: .datacube.conf}
+    archiveLocation:
+      archiveLogs: true
+      s3:
+        bucket: easido-prod-dc-data-projects
+        endpoint: s3.amazonaws.com
+        key: easi-workflows-team/biodiv/argo-artifacts/{{workflow.name}}/{{pod.name}}
+  # artifactGC is OnWorkflowDeletion, so this is also the window in which
+  # `argo cp ... --artifact-name run-evidence` still works. The S3 copies under _runs/ survive
+  # either way; this only governs the Argo-side copy.
+  ttlStrategy:
+    secondsAfterSuccess: 86400
