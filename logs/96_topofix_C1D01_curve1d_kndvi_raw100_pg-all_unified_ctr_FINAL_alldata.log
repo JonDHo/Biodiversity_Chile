@@ -1,0 +1,15 @@
+### 2026-09-11T18:55:23+00:00 :: scripts/77 --all-data
+/home/jovyan/temp/Biodiversity_Chile/src/biodiv/trainer.py:236: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at /__w/pytorch/pytorch/torch/csrc/autograd/generated/python_variable_methods.cpp:820.)
+  tot += float(loss) * y.shape[0]
+pool: 3102 parcelas, 7 facetas objetivo: ['lcbd_count_sorensen', 'pd_inext_q0', 'pd_inext_q1', 'pd_inext_q2', 'td_inext_q0', 'td_inext_q1', 'td_inext_q2']
+--all-data: fit on all 3102 plots, fixed epoch budget=28, no inner validation split
+C1D01_curve1d_kndvi_raw100_pg-all_unified_ctr_FINAL_alldata: 14,535 parametros, input (1, 100)
+  seed 0: 28 epocas (fijo), train_loss final=0.6987, fit=3102
+  seed 1: 28 epocas (fijo), train_loss final=0.6993, fit=3102
+  seed 2: 28 epocas (fijo), train_loss final=0.7148, fit=3102
+  seed 3: 28 epocas (fijo), train_loss final=0.6972, fit=3102
+  seed 4: 28 epocas (fijo), train_loss final=0.7123, fit=3102
+
+-> results/models_unified_topofix/C1D01_curve1d_kndvi_raw100_pg-all_unified_ctr_FINAL_alldata/final  (5 checkpoints, 1.5m)
+Para inferencia: cargar cada model_seed*.pt, predecir, promediar (ensemble) sobre las semillas -- mismo patron que mx.ensemble_oof usa entre folds.
