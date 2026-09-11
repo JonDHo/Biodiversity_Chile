@@ -54,9 +54,10 @@
 # ---------------------------------------------------------------------
 # UNVERIFIED FROM OUTSIDE THE CLUSTER -- check these two before the first submit
 # ---------------------------------------------------------------------
-#  1. The GPU scheduling hints (the toleration under infer-chunk, and whether this cluster
-#     also wants a nodeSelector). The CPU images and pod shape here are the ones
-#     process_argo.yaml already proves; the GPU node labels cannot be read from a CPU pod.
+#  1. The GPU scheduling hints. The arch is pinned to amd64 (the images have no arm64
+#     variant) and the standard NVIDIA taint is tolerated, but whether this cluster ALSO
+#     wants a GPU-specific node label cannot be read from a CPU pod. gpu-preflight is a
+#     one-minute, one-pod test of exactly this.
 #  2. cuda-tag is set to 13-2-1 and gpu-image-tag to develop.latest; both were confirmed to
 #     exist on 2026-09-11. Neither is something this file can re-check for itself, and
 #     develop.latest moves, so if GPU pods fail to pull that is the first thing to look at --
@@ -119,11 +120,14 @@ spec:
     # a minute if the tag is wrong, rather than at the end of a `main` run.
     - name: cuda-tag
       value: 13-2-1
-    # Confirmed to exist in the 13-2-1 repository on 2026-09-11 (pushed 2026-09-06). The only
-    # other tags there are PR builds -- PR35, PR38-amd64, PR39 -- which are branch images, not
-    # release ones, so develop.latest is the right choice even though some PR tags are newer.
-    # It is a moving tag: it will point at something else after the next merge, which is what
-    # gpu-preflight is for.
+    # Confirmed to exist in the 13-2-1 repository on 2026-09-11 (pushed 2026-09-06). The other
+    # tags are PR builds (PR35, PR38, PR39), which are branch images rather than release ones,
+    # so develop.latest is right even though some PR tags are newer. It is a moving tag: it
+    # will point at something else after the next merge, which is what gpu-preflight is for.
+    #
+    # The bare tag is the manifest index; every tag also exists as `<tag>-amd64`, and there is
+    # NO arm64 variant. Use the bare tag (the index resolves to the platform image), but see
+    # the nodeSelector on the GPU templates: amd64-only images are why it is pinned.
     - name: gpu-image-tag
       value: develop.latest
     - name: aws-image
@@ -345,6 +349,12 @@ spec:
       resources:
         limits: {cpu: '1', memory: 4Gi, nvidia.com/gpu: 1}
         requests: {cpu: '1', memory: 4Gi, nvidia.com/gpu: 1}
+    # amd64 because the image has no arm64 variant (see gpu-image-tag). This is not
+    # belt-and-braces: a T4 exists in both flavours -- g4dn is amd64, g5g is Graviton with a
+    # T4G -- so without this, Karpenter picking a g5g on price gives a node whose GPU is
+    # perfectly good and whose image will not run on it.
+    nodeSelector:
+      kubernetes.io/arch: amd64
     tolerations:
     - key: nvidia.com/gpu
       operator: Exists
@@ -758,6 +768,8 @@ spec:
     # above is the standard request and is usually enough with a device plugin installed; the
     # toleration below is the common NVIDIA taint. If the cluster labels GPU nodes instead, add
     # a nodeSelector here. Confirm before the first submit -- see the header.
+    nodeSelector:
+      kubernetes.io/arch: amd64
     tolerations:
     - key: nvidia.com/gpu
       operator: Exists
