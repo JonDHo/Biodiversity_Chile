@@ -87,9 +87,23 @@ spec:
     # a repository name. 13-2-1 was current on 2026-09-11; it moves, so check before a run
     # after a long gap. It is not discoverable from a Jupyter pod -- the registry is in account
     # 444488357543 while the notebook role lives in 262301216538, so ecr:DescribeRepositories
-    # is denied cross-account. To re-check: `aws ecr list-images` with workflows-account
-    # credentials, or `kubectl -n easi-workflows-argo get pod <a GPU pod> -o
-    # jsonpath='{.spec.containers[*].image}'` against an existing GPU workflow.
+    # is denied cross-account. To re-check, with credentials for the workflows account:
+    #
+    #   # which CUDA versions exist -- each is its OWN repository, the version is in the name
+    #   aws ecr describe-repositories --registry-id 444488357543 --region us-west-2 \
+    #     --query 'repositories[?contains(repositoryName, `nvidia`)].repositoryName' --output table
+    #
+    #   # which tags exist inside one, newest last
+    #   aws ecr describe-images --registry-id 444488357543 --region us-west-2 \
+    #     --repository-name easi-workflows-base-nvidia-13-2-1-torch-cudnn-runtime \
+    #     --query 'sort_by(imageDetails,&imagePushedAt)[].[imagePushedAt,imageTags[0]]' --output table
+    #
+    # Or, if ECR is denied but the cluster is reachable, ask a running pod what it uses:
+    #   kubectl -n easi-workflows-argo get pods \
+    #     -o jsonpath='{range .items[*]}{.spec.containers[*].image}{"\n"}{end}' | sort -u | grep -i nvidia
+    #
+    # gpu-preflight below is what actually settles it: it pulls this exact image and fails in
+    # a minute if the tag is wrong, rather than at the end of a `main` run.
     - name: cuda-tag
       value: 13-2-1
     # The repository NAME is confirmed; this image TAG is assumed, by analogy with the CPU
