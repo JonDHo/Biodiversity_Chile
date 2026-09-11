@@ -375,10 +375,53 @@ spec:
         # Actually run something, because is_available() alone has never proven a kernel runs.
         a = torch.randn(256, 256, device="cuda")
         print("matmul ok:", float((a @ a).sum()) == float((a @ a).sum()), flush=True)
+
+        # Is /scratch actually on the NVMe? The nodeAffinity guarantees the INSTANCE has local
+        # NVMe, but whether an emptyDir lands on it depends on the NodeClass wiring the instance
+        # store into the kubelet dataroot -- which this workflow cannot see. So measure it.
+        # docs/21 8.16: reading a staged store is decompression-bound at ~0,48 s and needs
+        # ~700 MB/s from disk to stay that way; gp3 at 125 MB/s would make it ~2,7 s.
+        # This REPORTS and does not fail: ~2,7 s is still no worse than the 3,1 s of reading
+        # straight from S3, so a slow scratch means staging stops winning, not that the run
+        # breaks. Failing here would block a perfectly good inference pass.
+        import os, time
+        probe, n = "/scratch/probe.bin", 1_500_000_000
+        try:
+            buf = b"\0" * (1 << 20)
+            t = time.perf_counter()
+            with open(probe, "wb") as f:
+                for _ in range(n >> 20):
+                    f.write(buf)
+                f.flush(); os.fsync(f.fileno())
+            wrote = time.perf_counter() - t
+            fd = os.open(probe, os.O_RDONLY)                 # drop it from page cache first,
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)   # or this measures RAM
+            os.close(fd)
+            t = time.perf_counter()
+            with open(probe, "rb") as f:
+                while f.read(1 << 20):
+                    pass
+            read = time.perf_counter() - t
+            mb = n / 1e6
+            print(f"/scratch write {mb / wrote:.0f} MB/s, cold read {mb / read:.0f} MB/s",
+                  flush=True)
+            # ~700 MB/s is where the read stops being I/O-bound (docs/21 8.16). Below it,
+            # staging roughly ties reading from S3, so it is wasted effort but not a failure.
+            print("/scratch verdict:", "NVMe-class, staging wins" if mb / read > 500 else
+                  "SLOW for an NVMe request -- staging only ties reading from S3; check "
+                  "whether the NodeClass puts the instance store on the kubelet dataroot",
+                  flush=True)
+        except Exception as e:
+            print(f"/scratch probe skipped: {type(e).__name__}: {e}", flush=True)
+        finally:
+            try: os.unlink(probe)
+            except OSError: pass
         print("GPU PREFLIGHT OK", flush=True)
       resources:
         limits: {cpu: '1', memory: 4Gi, nvidia.com/gpu: 1}
         requests: {cpu: '1', memory: 4Gi, nvidia.com/gpu: 1}
+      volumeMounts:
+      - {mountPath: /scratch, name: scratch}
     # ---- scheduling onto dask-gpu-worker-node-pool -------------------------------------
     # Reuses the existing Karpenter pool "dask-gpu-worker-node-pool" (spot, instance-category
     # p/g, amd64). There is no dedicated pool for this job and that pool has ample limits
@@ -417,6 +460,24 @@ spec:
             - key: eks.amazonaws.com/instance-gpu-count
               operator: In
               values: ['1']
+            # Local NVMe, and this one is LOAD-BEARING rather than a nicety. Measured
+            # (docs/21 8.16): a staged store reads in 0,47 s warm but 2,50 s genuinely cold on a
+            # ~134 MB/s filesystem, against 3,1 s reading straight from S3. So on a gp3-backed
+            # emptyDir, staging is a dead heat and stage_cube.py is work for nothing; it only
+            # pays where the disk can supply ~700 MB/s and the read goes back to being
+            # decompression-bound. Every shape that survives the two filters above
+            # (g4dn, g5, g6, g6e) carries >=125 GB of it, so this narrows nothing in practice;
+            # it excludes p3, which is EBS-only, and which the v100 filter already excluded.
+            # 100 GB leaves room for a CUDA image plus the staged chunk several times over.
+            #
+            # CAVEAT: this guarantees the INSTANCE has NVMe, not that the emptyDir lands on it
+            # -- that depends on the NodeClass wiring the instance store into the kubelet's
+            # dataroot. EKS Auto Mode NodeClasses generally do this automatically, but this pool
+            # uses a shared one and it is not verifiable from here, so gpu-preflight measures
+            # the scratch volume directly rather than assuming.
+            - key: eks.amazonaws.com/instance-local-nvme
+              operator: Gt
+              values: ['100']
     tolerations:
     - key: nvidia.com/gpu
       operator: Exists
@@ -426,6 +487,12 @@ spec:
       value: worker
       effect: NoSchedule
     retryStrategy: {limit: 1, retryPolicy: OnError}
+    volumes:
+    # Same kind of volume infer-chunk stages the cube into, so the probe above measures the
+    # thing that will actually hold it. Small: the probe writes 1,5 GB.
+    - name: scratch
+      emptyDir:
+        sizeLimit: 8Gi
 
   - name: check-access
     inputs:
@@ -884,6 +951,24 @@ spec:
             - key: eks.amazonaws.com/instance-gpu-count
               operator: In
               values: ['1']
+            # Local NVMe, and this one is LOAD-BEARING rather than a nicety. Measured
+            # (docs/21 8.16): a staged store reads in 0,47 s warm but 2,50 s genuinely cold on a
+            # ~134 MB/s filesystem, against 3,1 s reading straight from S3. So on a gp3-backed
+            # emptyDir, staging is a dead heat and stage_cube.py is work for nothing; it only
+            # pays where the disk can supply ~700 MB/s and the read goes back to being
+            # decompression-bound. Every shape that survives the two filters above
+            # (g4dn, g5, g6, g6e) carries >=125 GB of it, so this narrows nothing in practice;
+            # it excludes p3, which is EBS-only, and which the v100 filter already excluded.
+            # 100 GB leaves room for a CUDA image plus the staged chunk several times over.
+            #
+            # CAVEAT: this guarantees the INSTANCE has NVMe, not that the emptyDir lands on it
+            # -- that depends on the NodeClass wiring the instance store into the kubelet's
+            # dataroot. EKS Auto Mode NodeClasses generally do this automatically, but this pool
+            # uses a shared one and it is not verifiable from here, so gpu-preflight measures
+            # the scratch volume directly rather than assuming.
+            - key: eks.amazonaws.com/instance-local-nvme
+              operator: Gt
+              values: ['100']
     tolerations:
     - key: nvidia.com/gpu
       operator: Exists
@@ -928,7 +1013,12 @@ spec:
     # bigger chunk would OOM the pod rather than fill a disk.
     - name: scratch
       emptyDir:
-        sizeLimit: 32Gi
+        # tiles-per-pod x ~392 MB is the staged cube: ~7 GB at the default 18 tiles, ~36 GB if
+        # a chunk ever carried 90. 64Gi covers both with room to spare and sits comfortably
+        # inside the 225 GB of NVMe on a g4dn.2xlarge once the CUDA image (~10-20 GB) is
+        # allowed for. Capacity is not the binding constraint here -- throughput is, which is
+        # what the instance-local-nvme requirement above is for.
+        sizeLimit: 64Gi
     - name: db-config
       secret:
         secretName: '{{workflow.parameters.db-config-secret}}'
