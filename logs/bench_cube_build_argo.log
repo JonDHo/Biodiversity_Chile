@@ -1,0 +1,33 @@
+# build-only en el cluster, 2026-09-11 (workflow biodiv-cube-jcznk).
+# scripts/argo/cube_argo.yaml --entrypoint build-only -p limit-tiles=6 -p num-chunks=1,
+# repo JonDHo/perf-dev. Un pod build-chunk (7 CPU / 30Gi), --workers 7, --resume.
+# Pods recolectados al terminar (podGC OnWorkflowSuccess); esto es lo que quedo en pantalla
+# mas el manifest.csv y run.json que upload_run_evidence.py dejo en S3.
+
+biodiv-cube-jcznk-build-chunk-682789821: dask: local cluster, 7 workers
+biodiv-cube-jcznk-build-chunk-682789821: [1/6] t2_446: (524, 333, 333) load 110.6s -> 52.4 MB write 1.8s
+biodiv-cube-jcznk-build-chunk-682789821: [2/6] t2_447: (622, 333, 333) load 109.9s -> 53.6 MB write 1.8s
+biodiv-cube-jcznk-build-chunk-682789821: [3/6] t2_448: (622, 333, 333) load 99.9s -> 63.7 MB write 1.8s
+biodiv-cube-jcznk-build-chunk-682789821: [4/6] t2_449: (754, 333, 333) load 159.0s -> 62.6 MB write 2.1s
+biodiv-cube-jcznk-build-chunk-682789821: [5/6] t2_450: (740, 333, 333) load 131.0s -> 67.6 MB write 2.3s
+biodiv-cube-jcznk-build-chunk-682789821: [6/6] t2_451: (740, 333, 333) load 132.7s -> 66.5 MB write 1.8s
+biodiv-cube-jcznk-build-chunk-682789821: built 6, skipped 0, errors 0 of 6 in 12.6 min
+biodiv-cube-jcznk-build-chunk-682789821: evidence -> s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/cube/chile_30m/_runs/biodiv-cube-jcznk/chunk-0/manifest.csv
+biodiv-cube-jcznk-build-chunk-682789821: evidence -> s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/cube/chile_30m/_runs/biodiv-cube-jcznk/chunk-0/run.json
+
+# argo get: check-access 10 s, list-to-build 2 min, split-tiles 5 s, build-chunk 15 min
+# (12,6 min de construccion + git-sync, arranque del cluster y subida de evidencia).
+# Duracion total del workflow 18 min 6 s.
+
+# manifest.csv
+tile_id,status,n_dates,ny,nx,load_seconds,write_seconds,bytes,path
+t2_446,ok,524,333,333,110.6,1.8,52360776,s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/cube/chile_30m/v1_t2_446_30m_1998_2026.zarr
+t2_447,ok,622,333,333,109.9,1.8,53621838,s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/cube/chile_30m/v1_t2_447_30m_1998_2026.zarr
+t2_448,ok,622,333,333,99.9,1.8,63653192,s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/cube/chile_30m/v1_t2_448_30m_1998_2026.zarr
+t2_449,ok,754,333,333,159.0,2.1,62611872,s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/cube/chile_30m/v1_t2_449_30m_1998_2026.zarr
+t2_450,ok,740,333,333,131.0,2.3,67584606,s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/cube/chile_30m/v1_t2_450_30m_1998_2026.zarr
+t2_451,ok,740,333,333,132.7,1.8,66485835,s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/cube/chile_30m/v1_t2_451_30m_1998_2026.zarr
+
+# run.json: workers 7, clevel 1, zarr_tchunk_default 128, wall_seconds 758.5, ok 6, errors 0.
+# Los seis stores llevan el marcador de completitud (attributes.bbox en el zarr.json raiz),
+# verificado con un GET directo el 2026-09-11.

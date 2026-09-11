@@ -1226,3 +1226,39 @@ Cada tesela emite `UserWarning: Sending large graph of size 11.66 MiB`: son las 
 `dask_chunks={"time": 1}` serializadas al scheduler. El scheduler de hilos no lo paga porque
 corre en proceso. Es costo fijo por tesela, no impidió el 2,36x, y es la primera sospecha si el
 speedup no se sostiene al span de 27 años — donde el grafo crece a ~1.850 tareas.
+
+### 8.18 La pasada de construcción corre en Argo, y el ritmo por fecha se sostiene (medido 2026-09-11)
+
+Primera corrida de `scripts/argo/cube_argo.yaml` con `--entrypoint build-only`, 6 teselas en un
+chunk (workflow `biodiv-cube-jcznk`, `logs/bench_cube_build_argo.log`): **6 construidas, 0
+errores, 12,6 min** en un pod de 7 CPU / 30Gi con `--workers 7`, y el cluster registró los 7
+workers. Los seis stores quedaron en S3 con el marcador de completitud, y `manifest.csv` y
+`run.json` bajo `_runs/biodiv-cube-jcznk/chunk-0/`. Toda la plomería de la etapa —check-access,
+list-to-build, split, build, evidencia— pasó de una.
+
+| tesela | fechas | carga | s/fecha | store | MB/fecha |
+|---|---:|---:|---:|---:|---:|
+| t2_446 | 524 | 110,6 s | 0,211 | 52,4 MB | 0,100 |
+| t2_447 | 622 | 109,9 s | 0,177 | 53,6 MB | 0,086 |
+| t2_448 | 622 | 99,9 s | 0,161 | 63,7 MB | 0,102 |
+| t2_449 | 754 | 159,0 s | 0,211 | 62,6 MB | 0,083 |
+| t2_450 | 740 | 131,0 s | 0,177 | 67,6 MB | 0,091 |
+| t2_451 | 740 | 132,7 s | 0,179 | 66,5 MB | 0,090 |
+| **media** | | | **0,186** | | **0,092** |
+
+**Las teselas no son representativas, y la cifra que sí viaja es la de por fecha.** Son las seis
+primeras del CSV: la columna más occidental (`xmin` 19.980 en 19S) a ~50° S, en los fiordos, con
+524-754 fechas contra las ~1.850 del tramo de producción en el interior. Por eso los ~110-160 s
+por tesela no contradicen los ~360 s que `cube_argo.yaml` presupone: a **0,186 s/fecha** contra
+los 0,194 de §8.17 (292,2 s / 1.504 fechas), el ritmo del cluster de Jupyter se reproduce en el
+pod de Argo, y a 1.850 fechas da ~345 s. El presupuesto de 360 s/tesela se mantiene. La
+escritura a S3 es 1,8-2,3 s, algo menos que los 6,2 s de §8.17, porque son stores de un tercio.
+
+Los stores salen a ~0,09 MB/fecha contra los ~0,21 que §8.14 midió en t18_600, o sea el doble de
+compresión. Es lo esperable en teselas de costa con mucho NaN de océano, y no mueve la
+estimación de ~2,3 TB, que viene de una tesela de interior.
+
+Lo que esta corrida no prueba: el ritmo con varios pods en paralelo (`parallelism` 5 contra el
+índice ODC y S3 al mismo tiempo), ni una tesela de 1.850 fechas dentro del pod. Lo primero se ve
+en la corrida grande; lo segundo ya está medido en §8.17 y sólo cambiaría si el grafo de ~1.850
+tareas pesara más de lo que pesa el de 1.504.

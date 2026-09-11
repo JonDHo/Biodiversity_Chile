@@ -30,18 +30,21 @@
 # It is deliberately not the default for the first run, and `docs/24` 5 says why: resist
 # pipelining until A has run once. Overlapping loses nothing durable -- the stores land in S3
 # either way, so re-runs stay cheap -- but it does mean a bad cube is consumed before anyone
-# can look at it, and the build pass has never run at scale. Once it has, overlapping is
-# `argo submit --entrypoint infer-only` alongside a running build, with no edit to this file:
+# can look at it, and the build pass has only run at 6 tiles (`docs/21` 8.18). Once it has run
+# at scale, overlapping is `argo submit --entrypoint infer-only` alongside a running build,
+# with no edit to this file:
 # cube_progress.py and tile_progress.py both answer "what is ready" by listing S3, so a polling
 # pipeline falls out of the tooling that already exists.
 #
 # ---------------------------------------------------------------------
 # What each stage costs, measured
 # ---------------------------------------------------------------------
-# build-chunk  ~360 s/tile (27 years). The scheduler is `--workers 7`, NOT the `--load-threads`
-#              that process_argo.yaml uses: that setting is tuned around the CNN competing with
-#              the cluster's workers, and this pass has no CNN. Measured 688,8 s -> 292,2 s,
-#              2,36x, rasters bit-identical between the two (`docs/21` 8.17).
+# build-chunk  ~360 s/tile (27 years, ~1.850 dates). Measured 0,186 s/date in the pod (`docs/21`
+#              8.18), so a coastal tile with 600 dates takes ~110 s. The scheduler is
+#              `--workers 7`, NOT the `--load-threads` that process_argo.yaml uses: that setting
+#              is tuned around the CNN competing with the cluster's workers, and this pass has
+#              no CNN. Measured 688,8 s -> 292,2 s, 2,36x, rasters bit-identical between the
+#              two (`docs/21` 8.17).
 # infer-chunk  ~70 s/tile at --jobs 4 on one T4, from the cube (`docs/21` 8.15). The stores are
 #              pulled to node-local disk first by stage_cube.py: reading them there is 0,49 s a
 #              tile against 3,1 s direct from S3 (`docs/21` 8.16), which turns a ~13 % read tax
