@@ -54,12 +54,16 @@
 # ---------------------------------------------------------------------
 # UNVERIFIED FROM OUTSIDE THE CLUSTER -- check these two before the first submit
 # ---------------------------------------------------------------------
-#  1. gpu-image and the GPU scheduling hints (nodeSelector/tolerations under infer-chunk).
-#     The CPU images here are the ones process_argo.yaml already proves; the GPU image name
-#     and the node labels are guesses and cannot be confirmed from a CPU Jupyter pod.
-#  2. That the IRSA grant covers s3-cube. Every other prefix here is under the
-#     easi-workflows-team/ path that test-s3-access.yaml verified; s3-cube is a NEW prefix
-#     under it. Run test-s3-access.yaml against it first if in doubt.
+#  1. The GPU scheduling hints (the toleration under infer-chunk, and whether this cluster
+#     also wants a nodeSelector). The CPU images and pod shape here are the ones
+#     process_argo.yaml already proves; the GPU node labels cannot be read from a CPU pod.
+#  2. cuda-tag is set to 13-2-1, which was current on 2026-09-11 and is not something this
+#     file can re-check for itself. If GPU pods fail to pull, that is the first thing to look
+#     at -- and note it is hyphenated, since it is part of the repository name.
+#  (S3 is NOT a question: the easi-workflows-team service account carries access to every
+#   prefix below easi-workflows-team/, so the new cube/ prefix is covered like the rest.
+#   check-access still writes a preflight object to it, which costs nothing and localises a
+#   credential problem to the first second of the run.)
 apiVersion: argoproj.io/v1alpha1
 kind: Workflow
 metadata:
@@ -74,9 +78,24 @@ spec:
     parameters:
     - name: base-image
       value: 444488357543.dkr.ecr.us-west-2.amazonaws.com/easi-workflows-base-torch-cpu:develop.latest
-    # UNVERIFIED: the GPU counterpart of base-image. Must carry torch with CUDA.
-    - name: gpu-image
-      value: 444488357543.dkr.ecr.us-west-2.amazonaws.com/easi-workflows-base-torch-gpu:develop.latest
+    # The GPU image is composed from cuda-tag rather than written out, because the CUDA
+    # version is the only part anyone needs to change and it is the part nobody can guess.
+    # The repository is easi-workflows-base-nvidia-<CUDA_TAG>-torch-cudnn-runtime.
+    - name: gpu-registry
+      value: 444488357543.dkr.ecr.us-west-2.amazonaws.com
+    # NOTE THE HYPHENS: the CUDA version appears as 13-2-1, not 13.2.1, because it is part of
+    # a repository name. 13-2-1 was current on 2026-09-11; it moves, so check before a run
+    # after a long gap. It is not discoverable from a Jupyter pod -- the registry is in account
+    # 444488357543 while the notebook role lives in 262301216538, so ecr:DescribeRepositories
+    # is denied cross-account. To re-check: `aws ecr list-images` with workflows-account
+    # credentials, or `kubectl -n easi-workflows-argo get pod <a GPU pod> -o
+    # jsonpath='{.spec.containers[*].image}'` against an existing GPU workflow.
+    - name: cuda-tag
+      value: 13-2-1
+    # The repository NAME is confirmed; this image TAG is assumed, by analogy with the CPU
+    # base-image above. If the pull fails on a repository that exists, try this first.
+    - name: gpu-image-tag
+      value: develop.latest
     - name: aws-image
       value: amazon/aws-cli:2.17.62
     - name: repo-url
@@ -131,6 +150,10 @@ spec:
       tasks:
       - name: check-access
         template: check-access
+        arguments:
+          parameters:
+          - name: require-gpu
+            value: 'true'
       - name: list-to-build
         template: list-to-build
         depends: check-access
@@ -183,6 +206,10 @@ spec:
       tasks:
       - name: check-access
         template: check-access
+        arguments:
+          parameters:
+          - name: require-gpu
+            value: 'false'
       - name: list-to-build
         template: list-to-build
         depends: check-access
@@ -210,6 +237,10 @@ spec:
       tasks:
       - name: check-access
         template: check-access
+        arguments:
+          parameters:
+          - name: require-gpu
+            value: 'true'
       - name: list-missing-maps
         template: list-missing-maps
         depends: check-access
@@ -234,6 +265,11 @@ spec:
 
   # ---------------- steps ----------------
   - name: check-access
+    inputs:
+      parameters:
+      # Whether this run will reach a GPU pod. build-only never does, so it must not be held
+      # up by a CUDA tag it will never use.
+      - name: require-gpu
     script:
       command: [sh]
       image: '{{workflow.parameters.aws-image}}'
@@ -247,6 +283,18 @@ spec:
         aws s3 cp /tmp/preflight.txt "{{workflow.parameters.s3-cube}}/_preflight/{{workflow.name}}.txt"
         aws s3 cp /tmp/preflight.txt "{{workflow.parameters.s3-dest}}/_preflight/{{workflow.name}}.txt"
         aws s3 ls "{{workflow.parameters.s3-assets}}/tiles/{{workflow.parameters.tiles-csv-name}}"
+        # Fail now, not after the build stage. Under `main` the GPU pods are the LAST thing to
+        # run, so an unset CUDA tag would otherwise surface hours in, with the whole cube built
+        # and every GPU pod dying on ImagePullBackOff.
+        # Fail in the first second rather than after the build stage. Under `main` the GPU
+        # pods are the LAST thing to run, so an empty CUDA tag would otherwise surface hours
+        # in, with the whole cube built and every GPU pod dying on ImagePullBackOff.
+        if [ "{{inputs.parameters.require-gpu}}" = "true" ] \
+           && [ -z "{{workflow.parameters.cuda-tag}}" ]; then
+          echo "cuda-tag is empty; submit with -p cuda-tag=13-2-1 (hyphens, not dots)" >&2
+          echo "  (a build-only run does not need it: argo submit --entrypoint build-only)" >&2
+          exit 1
+        fi
 
   - name: list-to-build
     container:
@@ -523,7 +571,7 @@ spec:
       parameters:
       - name: chunk-id
     container:
-      image: '{{workflow.parameters.gpu-image}}'
+      image: '{{workflow.parameters.gpu-registry}}/easi-workflows-base-nvidia-{{workflow.parameters.cuda-tag}}-torch-cudnn-runtime:{{workflow.parameters.gpu-image-tag}}'
       command: [bash, -c]
       workingDir: /git/repo
       args:
