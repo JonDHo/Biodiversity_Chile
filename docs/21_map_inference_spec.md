@@ -1078,6 +1078,32 @@ O sea: **el SSD del nodo GPU vale ~12 % del tiempo de tesela, y sólo si se pref
 optimización de una fase que ya funciona sin ella, no un requisito — que es la conclusión a la
 que llegaba §5, pero por la razón contraria a la que daba.
 
+#### Los 0,49 s son de descompresión, no de disco (medido 2026-09-11)
+
+El 0,49 s de arriba se midió leyendo un store recién bajado, así que la objeción obvia es que lo
+sirvió el page cache y no el disco. **No es así, y la respuesta importa más de lo que parece.**
+Evictando las páginas de esos archivos con `posix_fadvise(POSIX_FADV_DONTNEED)` —que no necesita
+root— y midiendo en frío contra en caliente, tres repeticiones, mejor de cada una:
+
+| layout | en frío | en caliente | diferencia |
+|---|---:|---:|---:|
+| chunk entero | 1,55 s | 1,53 s | +0,02 s |
+| **tchunk 128** | **0,48 s** | 0,44 s | +0,04 s |
+
+El page cache vale **0,03 s, o sea nada**. La lectura está limitada por **descompresión**, y la
+diferencia entre los dos layouts es blosc corriendo en paralelo sobre varios chunks, no el disco.
+Eso confirma el número y de paso explica por qué cortar el eje temporal rinde 3x.
+
+**La consecuencia operativa es sobre qué disco hace falta.** Para que la lectura siga limitada por
+descompresión el disco tiene que entregar ~700 MB/s. Un NVMe local lo hace; un gp3 en su línea
+base de 125 MB/s no, y convertiría esos 0,48 s en ~2,7 s. Y ahí está lo que conviene tener claro:
+~2,7 s **no es peor** que los 3,1 s de leer directo de S3, así que bajar el store al nodo nunca
+pierde — simplemente deja de ganar. En un `emptyDir` de EKS el respaldo normal es el volumen raíz
+del kubelet (gp3), incluso en formas g4dn/g5 que traen NVMe local: pedir `ephemeral-storage` es una
+**cuota**, no una clase de dispositivo, así que no hay forma de pedir SSD desde el pod. Usar el
+instance store se configura en la NodeClass. `scripts/argo/stage_cube.py` imprime su propio
+throughput, así que la primera corrida real dice en qué régimen está el pool.
+
 #### Cortar el eje temporal es gratis, así que ahora es el default
 
 La Fase 0 escribía el eje temporal como **un solo chunk**. Cortarlo es estrictamente mejor en las

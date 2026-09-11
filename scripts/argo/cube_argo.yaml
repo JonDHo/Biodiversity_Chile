@@ -798,15 +798,19 @@ spec:
         # process wants ~1 vCPU for the residue -- so a small GPU with 8 vCPU is the shape that
         # fits (g4dn.2xlarge, g5.2xlarge), not a large or multi-GPU node.
         #
-        # 16Gi, NOT the 30Gi the build pod asks for, and the difference is load-bearing: a
-        # g4dn.2xlarge has 32 GiB with ~30 GiB allocatable, so a 30Gi request would not fit and
-        # Karpenter would step up to a 4xlarge -- twice the node to run the same four
-        # processes, which is precisely the over-provisioning 8.15 warns against. 16Gi is ample
-        # from the cube: there is no COG load transient at all, the staged array is ~820 MB per
-        # process and the interpolation was cut to 294 MiB (docs/21 8.8), so four processes sit
-        # near ~8 GB. The staged cube itself lives on disk, not in RAM.
-        limits: {cpu: '7', memory: 16Gi, nvidia.com/gpu: 1}
-        requests: {cpu: '7', memory: 16Gi, nvidia.com/gpu: 1}
+        # 24Gi, NOT the 30Gi the build pod asks for, and the ceiling is what matters here: a
+        # g4dn.2xlarge has 32 GiB with roughly 29-30 GiB allocatable once kubelet and the
+        # DaemonSets (NVIDIA device plugin, CNI) take their share. A 30Gi request would not fit
+        # and Karpenter would step up to a 4xlarge -- twice the node for the same four
+        # processes, the over-provisioning 8.15 warns against. 24Gi keeps clear of that edge
+        # while claiming memory the node has anyway, since it is provisioned whole either way.
+        #
+        # The work needs far less: from the cube there is no COG load transient at all, the
+        # array is ~820 MB per process and the interpolation was cut to 294 MiB (docs/21 8.8),
+        # so four processes sit near ~8 GB. The slack is deliberate headroom, not a requirement.
+        # IF KARPENTER STARTS CHOOSING A 4xlarge, THIS IS THE KNOB -- lower it.
+        limits: {cpu: '7', memory: 24Gi, nvidia.com/gpu: 1}
+        requests: {cpu: '7', memory: 24Gi, nvidia.com/gpu: 1}
       volumeMounts:
       - {mountPath: /work, name: work}
       - {mountPath: /git, name: git-data}
@@ -900,7 +904,28 @@ spec:
     # Node-local disk for the staged cube. 18 tiles x ~392 MB at 27 years is ~7 GB, so 32Gi is
     # over four times what a default chunk needs while staying small enough not to push
     # Karpenter onto a bigger instance for ephemeral storage alone. Raise it if tiles-per-pod
-    # goes up a lot. This is disk, so it does not count against the 16Gi of memory above.
+    # goes up a lot. This is disk, so it does not count against the memory above.
+    #
+    # THIS IS NOT A REQUEST FOR SSD, AND THERE IS NO WAY TO MAKE IT ONE FROM HERE. An
+    # `ephemeral-storage` request is a quota against whatever filesystem the kubelet already
+    # has -- it selects no device class. On EKS an emptyDir lands on the kubelet root volume,
+    # normally gp3 EBS, even on g4dn/g5 shapes that ship local NVMe; using the instance store
+    # takes `instanceStorePolicy` on the NodeClass, and this pool points at a SHARED NodeClass
+    # ("default"), so that is a cluster-level change and not ours to make casually.
+    #
+    # How much it matters, measured (docs/21 8.16): a chunked store reads in 0,48 s and that is
+    # DECOMPRESSION-bound, not I/O-bound -- evicting the page cache with posix_fadvise changed
+    # it by 0,03 s. To keep it decompression-bound the disk must supply ~700 MB/s. Local NVMe
+    # does; gp3 at its 125 MB/s baseline does not, and would make the same read ~2,7 s. Note
+    # what that does and does not cost: ~2,7 s is still no worse than the 3,1 s of reading
+    # straight from S3, so staging never loses -- it just stops winning. stage_cube.py prints
+    # its own throughput, so the first real run says which regime this pool is in.
+    #
+    # If it turns out to be slow and the win is wanted, the switch that needs no cluster change
+    # is `medium: Memory` here (tmpfs, RAM-speed). It is left off by default because tmpfs
+    # counts against the pod's memory limit, which silently couples this volume to
+    # tiles-per-pod: ~7 GB at 18 tiles fits inside 24Gi alongside ~8 GB of processes, but a
+    # bigger chunk would OOM the pod rather than fill a disk.
     - name: scratch
       emptyDir:
         sizeLimit: 32Gi
