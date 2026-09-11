@@ -1109,6 +1109,15 @@ dos mitades tienen forma distinta: `stage_cube.py` hace transferencias secuencia
 un pool de hilos —2,7 s por tesela— mientras que cuatro procesos leyendo chunks de S3 a la vez se
 pisan y pagan 8,3 s cada uno contra los 3,1 s que cuesta en solitario.
 
+**Confirmado en el cluster (2026-09-11, `logs/bench_gpu_preflight.log`).** El `emptyDir` sí cae
+sobre el NVMe: `gpu-preflight` midió **1.026 MB/s de escritura y 2.460 MB/s de lectura en frío**,
+muy por encima de los ~700 MB/s en que la lectura vuelve a estar limitada por descompresión. O
+sea que en el cluster aplica la fila "en caliente" de la tabla de arriba —~3,2 s por tesela
+contra 8,3 s leyendo directo, **2,6x**— y no la fila fría. La salvedad es que esa corrida cayó en
+un `g4dn.8xlarge` con 2 × 900 GB de NVMe; tras acotar el nodo a `instance-cpu < 16` la inferencia
+correrá en un `g4dn.2xlarge` con 1 × 225 GB, donde cabe esperar menos y basta con superar los
+~700 MB/s.
+
 Y en producción la lectura probablemente esté **en caliente de todos modos**: 18 teselas son ~6 GB
 bajados, el pod tiene un límite de 24Gi y el trabajo usa ~8 GB, así que el cubo bajado entra en el
 page cache al lado de los procesos. De ahí que el NVMe local sea una mejora barata y no un

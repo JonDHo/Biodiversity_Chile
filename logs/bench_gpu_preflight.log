@@ -1,0 +1,34 @@
+# gpu-check en el cluster, 2026-09-11 (workflow biodiv-cube-dp782).
+# scripts/argo/cube_argo.yaml --entrypoint gpu-check, pool dask-gpu-worker-node-pool.
+# NOTA: esta corrida fue ANTES de acotar el tamanio del nodo, asi que cayo en un
+# g4dn.8xlarge (32 vCPU, 1 T4, 2 x 900 GB NVMe). Las cifras de /scratch son de ese nodo.
+
+torch 2.14.0+cu130 built for CUDA 13.0
+device: Tesla T4  capability sm_75
+kernels built for: ['sm_75', 'sm_80', 'sm_86', 'sm_90', 'sm_100', 'sm_120']
+matmul ok: True
+/scratch write 1026 MB/s, cold read 2460 MB/s
+/scratch verdict: NVMe-class, staging wins
+GPU PREFLIGHT OK
+
+=== que queda probado ===
+1. El pool admite un pod que no es de dask: los dos taints tolerados y la etiqueta
+   k8s.dask.org/node-purpose alcanzan. Era la ultima incognita del workflow.
+2. La imagen armada desde cuda-tag 13-2-1 existe, baja y corre.
+3. La T4 esta soportada: sm_75 esta en la lista de kernels. La preocupacion por que
+   CUDA 13 hubiera soltado Turing era infundada.
+4. Y la exclusion de v100 queda PROBADA necesaria, no supuesta: sm_70 NO esta en la
+   lista. Un V100 habria bajado la imagen bien, visto la placa bien, y muerto en el
+   primer forward. El pool lo permite, asi que sin el filtro habria pasado.
+5. El emptyDir SI cae sobre el NVMe: 2.460 MB/s en frio contra el umbral de ~700 MB/s
+   en que la lectura vuelve a estar limitada por descompresion (docs/21 8.16). O sea
+   que bajar el cubo al nodo rinde el caso "en caliente" de esa tabla: ~3,2 s por
+   tesela contra 8,3 s leyendo directo de S3, 2,6x.
+6. La placa es la misma T4 sobre la que se midio 8.15, asi que la proyeccion de ~70 s
+   por tesela de 27 anios se sostiene sin ajuste de hardware.
+
+=== lo que falta re-verificar ===
+Las cifras de /scratch son de un 8xlarge con 2 x 900 GB de NVMe, probablemente en
+RAID0. Tras acotar el nodo a instance-cpu < 16 la inferencia va a correr en un
+g4dn.2xlarge, que trae 1 x 225 GB: se espera menos throughput, y basta con que quede
+por encima de ~700 MB/s. La proxima corrida de gpu-check lo dice.
