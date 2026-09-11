@@ -1078,36 +1078,46 @@ O sea: **el SSD del nodo GPU vale ~12 % del tiempo de tesela, y sólo si se pref
 optimización de una fase que ya funciona sin ella, no un requisito — que es la conclusión a la
 que llegaba §5, pero por la razón contraria a la que daba.
 
-#### Los 0,49 s son de caché, no de disco — y por eso el NVMe local es obligatorio (medido 2026-09-11)
+#### Los 0,49 s son de caché, no de disco — pero bajar el store gana igual (medido 2026-09-11)
 
-Los 0,49 s de arriba se midieron leyendo un store recién bajado, así que la objeción obvia es que
-lo sirvió el page cache. **Lo servía.** El primer intento de descartarlo estaba mal hecho y dio la
-respuesta cómoda: `POSIX_FADV_DONTNEED` sólo evicta páginas **limpias**, y sin un `fsync` previo
-las páginas recién escritas siguen sucias y se quedan en memoria. Con el `fsync` puesto, sobre el
-mismo store de tchunk 128:
+Los 0,49 s se midieron leyendo un store recién bajado, y los servía el page cache. El primer
+intento de descartarlo estaba mal hecho: `POSIX_FADV_DONTNEED` sólo evicta páginas **limpias**, y
+sin `fsync` previo las recién escritas siguen sucias y se quedan en memoria. Con el `fsync`, mismo
+store de tchunk 128:
 
 | método | lectura | throughput |
 |---|---:|---:|
-| `fadvise` solo (lo que se midió primero) | 0,47 s | 719 MB/s |
+| `fadvise` solo (lo medido primero) | 0,47 s | 719 MB/s |
 | **`fsync` y después `fadvise`** — frío de verdad | **2,50 s** | **134 MB/s** |
 
-Y 134 MB/s es exactamente lo que da una prueba de disco independiente en la misma máquina (1,5 GB
-escritos, `fsync`, evictados, releídos: 141 MB/s de escritura, 131 MB/s de lectura en frío). O sea
-que los dos números son reales y miden cosas distintas: **0,47 s es el techo con el dato en RAM y
-está limitado por descompresión; 2,50 s es lo que cuesta cuando hay que ir al disco, y está
-limitado por I/O.** La ganancia de cortar el eje temporal (0,47 contra 1,53 s en caliente) sigue
-siendo real y sigue siendo blosc en paralelo.
+Los 134 MB/s coinciden con una prueba de disco independiente en la misma máquina (1,5 GB, `fsync`,
+evictados, releídos: 141 de escritura, 131 de lectura en frío). Los dos números son reales y miden
+cosas distintas: **0,47 s es el techo con el dato en RAM, limitado por descompresión; 2,50 s es lo
+que cuesta ir al disco, limitado por I/O.**
 
-**Lo que eso cambia en el diseño.** Sobre un disco de ~134 MB/s, bajar el store al nodo cuesta
-~2,5 s por tesela contra los 3,1 s de leerlo directo de S3: **queda en empate y no compra nada.**
-Para que la lectura vuelva a estar limitada por descompresión el disco tiene que entregar
-~700 MB/s, que es territorio de NVMe local. Por eso el workflow exige
-`eks.amazonaws.com/instance-local-nvme` y no sólo una GPU: sin eso, `stage_cube.py` es trabajo
-para nada. Un `emptyDir` de EKS cae por defecto en el volumen raíz del kubelet —gp3, incluso en
-formas g4dn/g5 que traen NVMe— y pedir `ephemeral-storage` es una **cuota**, no una clase de
-dispositivo, así que la selección tiene que pasar por el nodo. Como que el `emptyDir` termine
-sobre el NVMe depende de cómo la NodeClass conecte el instance store, `gpu-preflight` **mide el
-volumen** en vez de suponerlo, y lo reporta sin fallar: en el peor caso staging empata, no rompe.
+**Y acá está la comparación que importa, que es la que hay que hacer a `--jobs 4`** —la forma de
+producción— y no contra la lectura directa de un solo proceso:
+
+| por tesela, `--jobs 4` | costo de lectura | % de la tesela |
+|---|---:|---:|
+| directo de S3, sin bajar nada | **8,3 s** | 10,6 % |
+| bajado, lectura de disco en caliente | 2,7 + 0,47 = **3,2 s** | 4,3 % |
+| bajado, lectura de disco en frío a 134 MB/s | 2,7 + 2,50 = **5,2 s** | 6,9 % |
+
+**Bajar el store gana en los dos casos: 2,6x en caliente y 1,6x en frío.** El motivo es que las
+dos mitades tienen forma distinta: `stage_cube.py` hace transferencias secuenciales en bloque con
+un pool de hilos —2,7 s por tesela— mientras que cuatro procesos leyendo chunks de S3 a la vez se
+pisan y pagan 8,3 s cada uno contra los 3,1 s que cuesta en solitario.
+
+Y en producción la lectura probablemente esté **en caliente de todos modos**: 18 teselas son ~6 GB
+bajados, el pod tiene un límite de 24Gi y el trabajo usa ~8 GB, así que el cubo bajado entra en el
+page cache al lado de los procesos. De ahí que el NVMe local sea una mejora barata y no un
+requisito: hace que el caso frío rinda como el caliente, y cubre el caso en que el chunk crezca
+más de lo que el caché aguanta. Un `emptyDir` de EKS cae por defecto en el volumen raíz del
+kubelet —gp3, incluso en formas g4dn/g5 que traen NVMe— y pedir `ephemeral-storage` es una
+**cuota**, no una clase de dispositivo, así que la selección va por el nodo
+(`eks.amazonaws.com/instance-local-nvme`). Como que el `emptyDir` termine sobre el NVMe depende de
+la NodeClass, `gpu-preflight` **mide** el volumen y lo reporta sin fallar.
 
 #### Cortar el eje temporal es gratis, así que ahora es el default
 

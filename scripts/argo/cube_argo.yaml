@@ -460,12 +460,14 @@ spec:
             - key: eks.amazonaws.com/instance-gpu-count
               operator: In
               values: ['1']
-            # Local NVMe, and this one is LOAD-BEARING rather than a nicety. Measured
-            # (docs/21 8.16): a staged store reads in 0,47 s warm but 2,50 s genuinely cold on a
-            # ~134 MB/s filesystem, against 3,1 s reading straight from S3. So on a gp3-backed
-            # emptyDir, staging is a dead heat and stage_cube.py is work for nothing; it only
-            # pays where the disk can supply ~700 MB/s and the read goes back to being
-            # decompression-bound. Every shape that survives the two filters above
+            # Local NVMe: a cheap improvement, not a prerequisite. Measured (docs/21 8.16),
+            # per tile at --jobs 4: reading straight from S3 costs 8,3 s (four readers contend;
+            # 3,1 s solo), staging costs 2,7 s of transfer plus 0,47 s to read back warm or
+            # 2,50 s genuinely cold on a ~134 MB/s disk. So staging wins either way -- 2,6x warm,
+            # 1,6x cold -- and NVMe buys the difference between those two. It also covers the
+            # case where a chunk outgrows the page cache, which at the default 18 tiles it does
+            # not: ~6 GB staged against a 24Gi limit with ~8 GB of work. Every shape that
+            # survives the two filters above
             # (g4dn, g5, g6, g6e) carries >=125 GB of it, so this narrows nothing in practice;
             # it excludes p3, which is EBS-only, and which the v100 filter already excluded.
             # 100 GB leaves room for a CUDA image plus the staged chunk several times over.
@@ -951,12 +953,14 @@ spec:
             - key: eks.amazonaws.com/instance-gpu-count
               operator: In
               values: ['1']
-            # Local NVMe, and this one is LOAD-BEARING rather than a nicety. Measured
-            # (docs/21 8.16): a staged store reads in 0,47 s warm but 2,50 s genuinely cold on a
-            # ~134 MB/s filesystem, against 3,1 s reading straight from S3. So on a gp3-backed
-            # emptyDir, staging is a dead heat and stage_cube.py is work for nothing; it only
-            # pays where the disk can supply ~700 MB/s and the read goes back to being
-            # decompression-bound. Every shape that survives the two filters above
+            # Local NVMe: a cheap improvement, not a prerequisite. Measured (docs/21 8.16),
+            # per tile at --jobs 4: reading straight from S3 costs 8,3 s (four readers contend;
+            # 3,1 s solo), staging costs 2,7 s of transfer plus 0,47 s to read back warm or
+            # 2,50 s genuinely cold on a ~134 MB/s disk. So staging wins either way -- 2,6x warm,
+            # 1,6x cold -- and NVMe buys the difference between those two. It also covers the
+            # case where a chunk outgrows the page cache, which at the default 18 tiles it does
+            # not: ~6 GB staged against a 24Gi limit with ~8 GB of work. Every shape that
+            # survives the two filters above
             # (g4dn, g5, g6, g6e) carries >=125 GB of it, so this narrows nothing in practice;
             # it excludes p3, which is EBS-only, and which the v100 filter already excluded.
             # 100 GB leaves room for a CUDA image plus the staged chunk several times over.
