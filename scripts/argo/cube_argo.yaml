@@ -57,9 +57,10 @@
 #  1. The GPU scheduling hints (the toleration under infer-chunk, and whether this cluster
 #     also wants a nodeSelector). The CPU images and pod shape here are the ones
 #     process_argo.yaml already proves; the GPU node labels cannot be read from a CPU pod.
-#  2. cuda-tag is set to 13-2-1, which was current on 2026-09-11 and is not something this
-#     file can re-check for itself. If GPU pods fail to pull, that is the first thing to look
-#     at -- and note it is hyphenated, since it is part of the repository name.
+#  2. cuda-tag is set to 13-2-1 and gpu-image-tag to develop.latest; both were confirmed to
+#     exist on 2026-09-11. Neither is something this file can re-check for itself, and
+#     develop.latest moves, so if GPU pods fail to pull that is the first thing to look at --
+#     and note the CUDA version is hyphenated, since it is part of the repository name.
 #  (S3 is NOT a question: the easi-workflows-team service account carries access to every
 #   prefix below easi-workflows-team/, so the new cube/ prefix is covered like the rest.
 #   check-access still writes a preflight object to it, which costs nothing and localises a
@@ -118,8 +119,11 @@ spec:
     # a minute if the tag is wrong, rather than at the end of a `main` run.
     - name: cuda-tag
       value: 13-2-1
-    # The repository NAME is confirmed; this image TAG is assumed, by analogy with the CPU
-    # base-image above. If the pull fails on a repository that exists, try this first.
+    # Confirmed to exist in the 13-2-1 repository on 2026-09-11 (pushed 2026-09-06). The only
+    # other tags there are PR builds -- PR35, PR38-amd64, PR39 -- which are branch images, not
+    # release ones, so develop.latest is the right choice even though some PR tags are newer.
+    # It is a moving tag: it will point at something else after the next merge, which is what
+    # gpu-preflight is for.
     - name: gpu-image-tag
       value: develop.latest
     - name: aws-image
