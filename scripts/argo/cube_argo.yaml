@@ -443,13 +443,11 @@ spec:
             except OSError: pass
         print("GPU PREFLIGHT OK", flush=True)
       resources:
-        # Deliberately the SAME request as infer-chunk, not the 1 CPU / 4Gi this probe needs.
-        # The point of the preflight is to prove the node inference will actually get: with a
-        # smaller request it would fit a g4dn.xlarge and prove the wrong shape, since it is the
-        # 24Gi that pushes the choice to a 2xlarge. Karpenter provisions a whole node either
-        # way, so asking for more costs nothing and the pod lives about a minute.
-        limits: {cpu: '7', memory: 24Gi, nvidia.com/gpu: 1}
-        requests: {cpu: '7', memory: 24Gi, nvidia.com/gpu: 1}
+        # Deliberately the SAME request as infer-chunk, so the preflight provisions the shape
+        # inference will actually get rather than a different one. Karpenter brings up a whole
+        # node either way, so asking for this costs nothing and the pod lives about a minute.
+        limits: {cpu: '6', memory: 20Gi, nvidia.com/gpu: 1}
+        requests: {cpu: '6', memory: 20Gi, nvidia.com/gpu: 1}
       volumeMounts:
       - {mountPath: /scratch, name: scratch}
     # ---- scheduling onto dask-gpu-worker-node-pool -------------------------------------
@@ -517,13 +515,17 @@ spec:
             # score. It is ~3x the price of a 2xlarge for exactly the same one card, which is
             # the "per-unit waste" this project ranks against even when scale-out is cheap.
             #
-            # Lt 16 leaves the xlarge and 2xlarge shapes of every GPU family (g4dn, g5, g6,
-            # g6e). The 24Gi memory request then picks 2xlarge on its own, since an xlarge has
-            # only 16 GiB -- so the effective target is exactly the 8-vCPU shape docs/21 8.15
-            # asks for, reached by two independent constraints rather than by naming instances.
+            # Lt 17 means <=16 vCPU, which leaves xlarge, 2xlarge and 4xlarge of every GPU
+            # family and excludes the 8xlarge that the first run picked. It is deliberately NOT
+            # tighter: Karpenter costs the options and takes the cheapest that fits, so the
+            # 2xlarge gets chosen on its own once the pod actually fits one (see the resource
+            # request) -- while leaving a 4xlarge available if 2xlarge spot capacity is not.
+            # Forbidding 4xlarge outright traded a 2x waste for an unschedulable pod, which is
+            # the worse failure: the first attempt at this cap deadlocked with "no instance type
+            # met the scheduling requirements".
             - key: eks.amazonaws.com/instance-cpu
               operator: Lt
-              values: ['16']
+              values: ['17']
     tolerations:
     - key: nvidia.com/gpu
       operator: Exists
@@ -911,19 +913,24 @@ spec:
         # process wants ~1 vCPU for the residue -- so a small GPU with 8 vCPU is the shape that
         # fits (g4dn.2xlarge, g5.2xlarge), not a large or multi-GPU node.
         #
-        # 24Gi, NOT the 30Gi the build pod asks for, and the ceiling is what matters here: a
-        # g4dn.2xlarge has 32 GiB with roughly 29-30 GiB allocatable once kubelet and the
-        # DaemonSets (NVIDIA device plugin, CNI) take their share. A 30Gi request would not fit
-        # and Karpenter would step up to a 4xlarge -- twice the node for the same four
-        # processes, the over-provisioning 8.15 warns against. 24Gi keeps clear of that edge
-        # while claiming memory the node has anyway, since it is provisioned whole either way.
+        # 6 CPU / 20Gi, and BOTH numbers are set by what fits a g4dn.2xlarge rather than by
+        # what the work wants -- which is the whole point, since that 8-vCPU shape is what
+        # docs/21 8.15 asks for.
         #
-        # The work needs far less: from the cube there is no COG load transient at all, the
-        # array is ~820 MB per process and the interpolation was cut to 294 MiB (docs/21 8.8),
-        # so four processes sit near ~8 GB. The slack is deliberate headroom, not a requirement.
-        # IF KARPENTER STARTS CHOOSING A 4xlarge, THIS IS THE KNOB -- lower it.
-        limits: {cpu: '7', memory: 24Gi, nvidia.com/gpu: 1}
-        requests: {cpu: '7', memory: 24Gi, nvidia.com/gpu: 1}
+        # The earlier 7 CPU / 24Gi did not fit one, and that is not arithmetic anyone should
+        # trust to intuition: Argo adds ~155m CPU and ~500Mi of its own to the request, so 7
+        # became 7155m against ~7910m allocatable, and the node's DaemonSets (CNI, kube-proxy,
+        # NVIDIA device plugin, logging) claim several hundred more. The result was first a
+        # silent upgrade to a g4dn.8xlarge -- 32 vCPU around one T4 -- and then, once the cap
+        # forbade that, an unschedulable pod. 6 CPU leaves room for ~1000m of DaemonSets.
+        #
+        # The work needs far less than either: from the cube there is no COG load transient at
+        # all, the array is ~820 MB per process and the interpolation was cut to 294 MiB
+        # (docs/21 8.8), so four processes sit near ~8 GB. --jobs 4 wants ~4 processes at ~1
+        # vCPU each plus residue, so 6 is right-sized and not a sacrifice. The remaining ~12 GiB
+        # is headroom for the page cache holding the staged cube (~6 GB at 18 tiles).
+        limits: {cpu: '6', memory: 20Gi, nvidia.com/gpu: 1}
+        requests: {cpu: '6', memory: 20Gi, nvidia.com/gpu: 1}
       volumeMounts:
       - {mountPath: /work, name: work}
       - {mountPath: /git, name: git-data}
@@ -1024,13 +1031,17 @@ spec:
             # score. It is ~3x the price of a 2xlarge for exactly the same one card, which is
             # the "per-unit waste" this project ranks against even when scale-out is cheap.
             #
-            # Lt 16 leaves the xlarge and 2xlarge shapes of every GPU family (g4dn, g5, g6,
-            # g6e). The 24Gi memory request then picks 2xlarge on its own, since an xlarge has
-            # only 16 GiB -- so the effective target is exactly the 8-vCPU shape docs/21 8.15
-            # asks for, reached by two independent constraints rather than by naming instances.
+            # Lt 17 means <=16 vCPU, which leaves xlarge, 2xlarge and 4xlarge of every GPU
+            # family and excludes the 8xlarge that the first run picked. It is deliberately NOT
+            # tighter: Karpenter costs the options and takes the cheapest that fits, so the
+            # 2xlarge gets chosen on its own once the pod actually fits one (see the resource
+            # request) -- while leaving a 4xlarge available if 2xlarge spot capacity is not.
+            # Forbidding 4xlarge outright traded a 2x waste for an unschedulable pod, which is
+            # the worse failure: the first attempt at this cap deadlocked with "no instance type
+            # met the scheduling requirements".
             - key: eks.amazonaws.com/instance-cpu
               operator: Lt
-              values: ['16']
+              values: ['17']
     tolerations:
     - key: nvidia.com/gpu
       operator: Exists
