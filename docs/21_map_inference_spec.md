@@ -1262,3 +1262,62 @@ Lo que esta corrida no prueba: el ritmo con varios pods en paralelo (`parallelis
 índice ODC y S3 al mismo tiempo), ni una tesela de 1.850 fechas dentro del pod. Lo primero se ve
 en la corrida grande; lo segundo ya está medido en §8.17 y sólo cambiaría si el grafo de ~1.850
 tareas pesara más de lo que pesa el de 1.504.
+
+### 8.19 La inferencia corre en Argo desde el cubo, el costo es por píxel predicho, y aparece un scikit-learn nuevo (medido 2026-09-11)
+
+Primera corrida de `--entrypoint infer-only`, sobre las seis teselas que §8.18 construyó
+(workflow `biodiv-cube-pqwbl`, `logs/bench_cube_infer_argo.log`): **162 GeoTIFF, 0 errores,
+7 min 49 s de workflow**, de los cuales `infer-chunk` fueron 4 min y la GPU facturada 1 min 54 s.
+El pod salió a un nodo de `dask-gpu-worker-node-pool` a la primera, sin el `gpu-preflight` —que
+se quitó de `main` e `infer-only` antes de esta corrida, porque el nodo que probaba se libera
+antes de que `infer-chunk` pida el suyo, y las restricciones de scheduling de §8.15-8.16 ya
+garantizan la forma; queda sólo como `--entrypoint gpu-check`—. `stage_cube.py` bajó los seis
+stores en 3,2 s (113 MB/s, igual que los 115 medidos en §8.16), los cuatro workers terminaron a
+los 98 s, y la evidencia quedó bajo `_runs/biodiv-cube-pqwbl/chunk-0/`.
+
+| tesela | px predichos/año (mediana) | 27 años | orden en el worker |
+|---|---:|---:|---|
+| t2_446 | 40.190 | 59 s | 1.º de 2 |
+| t2_447 | 33.709 | 54 s | 1.º de 2 |
+| t2_448 | 49.146 | 71 s | 1.º de 1 |
+| t2_449 | 3.991 | 26 s | 1.º de 1 |
+| t2_450 | 18.283 | 24 s | 2.º de 2 |
+| t2_451 | 14.226 | 22 s | 2.º de 2 |
+
+**El costo de una tesela es por píxel predicho, no por tesela.** Con los cuatro procesos
+concurrentes (la primera ola), los tiempos caen sobre una recta de **~22 s fijos + ~1,0 ms por
+píxel enmascarado** a 27 años: entre t2_449 (3.991 px, 26 s) y t2_448 (49.146 px, 71 s) la
+pendiente es 45 s / 45.155 px. t18_600 de §8.15 (46.553 px, ~62 s) cae sobre la misma recta. O
+sea que los ~70 s/tesela que `cube_argo.yaml` presupone son, en rigor, "una tesela con ~45.000
+píxeles de vegetación nativa". El número de fechas no entra —el store se lee en ~1 s
+(`load_seconds` 1,3 con cuatro lectores sobre `/scratch`)—; lo que entra es la fracción que
+deja pasar la máscara de MapBiomas, y no se conoce su distribución sobre las 5.769 teselas. Una
+tesela con ~100.000 de sus 110.889 píxeles en vegetación nativa costaría ~120 s, y si el
+interior es mayormente así, las ~34 horas-GPU de la corrida completa son más bien ~50. Los
+tiempos de la segunda ola (22-24 s con sólo dos procesos vivos) muestran además que los ~22 s
+fijos también tienen parte de contención.
+
+**Lo que hay que verificar antes de la corrida grande de inferencia: la imagen de GPU trae
+scikit-learn 1.9.1.** Los pickles de `StandardScaler` y `PowerTransformer` se escribieron con
+1.3.1 (§7) y todo lo validado hasta ahora —la compuerta de ida y vuelta de `scripts/74`, la
+tolerancia de 5,85e-6 de §8.15, los logs de `logs/chile_pod.log` y compañía— corrió bajo
+**1.8.0**. La imagen `easi-workflows-base-nvidia-13-2-1-torch-cudnn-runtime` es un cuarto
+entorno, y el `InconsistentVersionWarning` en `main.log` lo dice. El modo de fallo es el que
+`scripts/argo/check_scaler.py` describe: no falla, devuelve otros números, y los mapas parecen
+razonables. Dos comprobaciones, de la más barata a la que cierra la pregunta:
+
+1. `scripts/argo/check_scaler.py` dentro de la imagen de GPU: un pod, un minuto, y responde si
+   el scaler despickleado hace la ida y vuelta consigo mismo. Es necesaria y no suficiente.
+2. Inferir una de estas seis teselas desde el cubo en S3 en el pod de Jupyter (1.8.0, CPU) y
+   comparar los rásters contra los que esta corrida dejó en S3, con la misma tolerancia de
+   §8.15. Eso sí cierra la pregunta, porque compara la salida entera y no sólo el scaler.
+
+Hasta que pase la segunda, los 162 rásters de `biodiv-cube-pqwbl` son evidencia de plomería y
+no de mapas. La pasada de construcción no toca scikit-learn, así que nada de esto frena la
+corrida grande de construcción.
+
+Lo que esta corrida sí cierra: la imagen de CUDA corre `scripts/73` entero y no sólo torch; el
+camino cubo → `/scratch` → inferencia funciona en un pod; los assets de modelos y derivados
+están donde el workflow los busca; y el costo fijo del pod (~2,5 min de nodo, imagen, git-sync
+y `s3 sync`) es el mismo que en la construcción, así que los chunks de 50 teselas o más lo
+amortizan.

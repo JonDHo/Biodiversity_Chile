@@ -45,10 +45,15 @@
 #              is tuned around the CNN competing with the cluster's workers, and this pass has
 #              no CNN. Measured 688,8 s -> 292,2 s, 2,36x, rasters bit-identical between the
 #              two (`docs/21` 8.17).
-# infer-chunk  ~70 s/tile at --jobs 4 on one T4, from the cube (`docs/21` 8.15). The stores are
-#              pulled to node-local disk first by stage_cube.py: reading them there is 0,49 s a
-#              tile against 3,1 s direct from S3 (`docs/21` 8.16), which turns a ~13 % read tax
-#              into ~4 %. Staging measured 115 MB/s, ~2,7 s a tile.
+# infer-chunk  ~70 s/tile at --jobs 4 on one T4, from the cube (`docs/21` 8.15) -- but the cost
+#              is per PREDICTED PIXEL, ~22 s + ~1,0 ms per masked-in pixel over 27 years
+#              (`docs/21` 8.19), so 70 s is a tile with ~45.000 native-vegetation pixels and a
+#              fully vegetated one is ~120 s. The stores are pulled to node-local disk first by
+#              stage_cube.py: reading them there is 0,49 s a tile against 3,1 s direct from S3
+#              (`docs/21` 8.16), which turns a ~13 % read tax into ~4 %. Staging measured
+#              113-115 MB/s, ~2,7 s a tile.
+#              NOT YET VALIDATED: the GPU image ships scikit-learn 1.9.1; the scaler pickles
+#              were fitted with 1.3.1 and only ever checked under 1.8.0 (`docs/21` 8.19).
 #
 # Dedup, both stages, same principle as process_argo.yaml: no separate progress tracker, S3 is
 # the source of truth. cube_progress.py treats a tile as built only when its store carries the
@@ -65,7 +70,7 @@
 #     both its taints are tolerated, its node-purpose label is selected, V100 is excluded
 #     (Volta/sm_70, dropped by CUDA 13) and single-GPU instances are required. What remains
 #     unverified is only whether that pool actually admits a non-dask pod in practice, which
-#     gpu-preflight settles in one pod and one minute. NOTE it is a BORROWED pool: it is
+#     gpu-check settles in one pod and one minute. NOTE it is a BORROWED pool: it is
 #     described as dedicated to dask workers, and this workflow is not one.
 #  2. cuda-tag is set to 13-2-1 and gpu-image-tag to develop.latest; both were confirmed to
 #     exist on 2026-09-11. Neither is something this file can re-check for itself, and
@@ -109,7 +114,7 @@ spec:
     # NOTE THE HYPHENS: the CUDA version appears as 13-2-1, not 13.2.1, because it is part of
     # a repository name. On 2026-09-11 it was confirmed to be the ONLY CUDA version built in
     # this registry, and to be in regular use by the team -- so it is the right default and
-    # there is nothing to fall back TO. If gpu-preflight ever rejects it, the remedy is a
+    # there is nothing to fall back TO. If gpu-check ever rejects it, the remedy is a
     # different small GPU node rather than a different image; see the note there. It is not discoverable from a Jupyter pod -- the registry is in account
     # 444488357543 while the notebook role lives in 262301216538, so ecr:DescribeRepositories
     # is denied cross-account. To re-check, with credentials for the workflows account:
@@ -127,14 +132,14 @@ spec:
     #   kubectl -n easi-workflows-argo get pods \
     #     -o jsonpath='{range .items[*]}{.spec.containers[*].image}{"\n"}{end}' | sort -u | grep -i nvidia
     #
-    # gpu-preflight below is what actually settles it: it pulls this exact image and fails in
-    # a minute if the tag is wrong, rather than at the end of a `main` run.
+    # `--entrypoint gpu-check` is what actually settles it: it pulls this exact image and
+    # fails in a minute if the tag is wrong.
     - name: cuda-tag
       value: 13-2-1
     # Confirmed to exist in the 13-2-1 repository on 2026-09-11 (pushed 2026-09-06). The other
     # tags are PR builds (PR35, PR38, PR39), which are branch images rather than release ones,
     # so develop.latest is right even though some PR tags are newer. It is a moving tag: it
-    # will point at something else after the next merge, which is what gpu-preflight is for.
+    # will point at something else after the next merge, which is what gpu-check is for.
     #
     # Verified with `skopeo inspect --raw` on 2026-09-11, not inferred: the bare tag is an OCI
     # index (application/vnd.oci.image.index.v1+json) holding exactly ONE real platform,
@@ -206,12 +211,12 @@ spec:
   # ---------------- DAGs ----------------
   - name: main
     dag:
-      # If gpu-preflight fails, let the build stage run to completion anyway. The build is the
-      # expensive half (~360 s a tile) and it is fully resumable, so throwing away partly-built
-      # capacity to report a GPU problem sooner would be a poor trade -- the report is already
-      # immediate, since the preflight runs alongside the build rather than after it. Fix the
-      # image and submit --entrypoint infer-only against the cube that got built.
-      # It also means one bad build chunk does not cancel the other four, which are independent.
+      # One bad build chunk does not cancel the others, which are independent; the build is
+      # fully resumable, so a partial pass is worth keeping.
+      #
+      # No GPU preflight in the run itself: the node it would test is released before
+      # infer-chunk provisions its own, and the scheduling constraints on infer-chunk are what
+      # guarantee the shape. The standalone smoke test is `--entrypoint gpu-check`.
       failFast: false
       tasks:
       - name: check-access
@@ -220,9 +225,6 @@ spec:
           parameters:
           - name: require-gpu
             value: 'true'
-      - name: gpu-preflight
-        template: gpu-preflight
-        depends: check-access
       - name: list-to-build
         template: list-to-build
         depends: check-access
@@ -250,7 +252,7 @@ spec:
       # own deadlines, parallelism and retries.
       - name: list-missing-maps
         template: list-missing-maps
-        depends: build-chunk && gpu-preflight
+        depends: build-chunk
       - name: split-infer
         template: split-tiles
         depends: list-missing-maps
@@ -331,12 +333,9 @@ spec:
           parameters:
           - name: require-gpu
             value: 'true'
-      - name: gpu-preflight
-        template: gpu-preflight
-        depends: check-access
       - name: list-missing-maps
         template: list-missing-maps
-        depends: gpu-preflight
+        depends: check-access
       - name: split-infer
         template: split-tiles
         depends: list-missing-maps
@@ -360,8 +359,8 @@ spec:
   # Proves, in about a minute and on one short-lived pod, the three things about the GPU side
   # that nothing else here can check: that the image name resolves and pulls, that the
   # scheduling hints actually get this workflow a GPU, and that the torch in that image can
-  # run on the card it lands on. Under `main` the GPU pods are otherwise the LAST thing to
-  # run, so without this any of the three would surface with the whole cube already built.
+  # run on the card it lands on. Only the gpu-check entrypoint runs it: inside `main` or
+  # infer-only it would test a node that is gone by the time infer-chunk gets its own.
   #
   # The arch check is the non-obvious one, and it is cheap insurance rather than an expected
   # problem: the team uses this image regularly, so it is already known to work on the GPUs
@@ -578,9 +577,6 @@ spec:
         aws s3 cp /tmp/preflight.txt "{{workflow.parameters.s3-cube}}/_preflight/{{workflow.name}}.txt"
         aws s3 cp /tmp/preflight.txt "{{workflow.parameters.s3-dest}}/_preflight/{{workflow.name}}.txt"
         aws s3 ls "{{workflow.parameters.s3-assets}}/tiles/{{workflow.parameters.tiles-csv-name}}"
-        # Fail now, not after the build stage. Under `main` the GPU pods are the LAST thing to
-        # run, so an unset CUDA tag would otherwise surface hours in, with the whole cube built
-        # and every GPU pod dying on ImagePullBackOff.
         # Fail in the first second rather than after the build stage. Under `main` the GPU
         # pods are the LAST thing to run, so an empty CUDA tag would otherwise surface hours
         # in, with the whole cube built and every GPU pod dying on ImagePullBackOff.

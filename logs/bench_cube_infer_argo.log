@@ -1,0 +1,40 @@
+# infer-only en el cluster, 2026-09-11 (workflow biodiv-cube-pqwbl).
+# scripts/argo/cube_argo.yaml --entrypoint infer-only -p limit-tiles=6 -p num-chunks=1,
+# repo JonDHo/perf-dev. Sin gpu-preflight (quitado del DAG antes de esta corrida). Un pod
+# infer-chunk (6 CPU / 20Gi / 1 GPU), --jobs 4 --device cuda, BIODIV_TILE_ZARR=/scratch/cube.
+# Pods recolectados al terminar; esto es el main.log archivado en argo-artifacts/ mas los
+# worker_*.log que upload_run_evidence.py dejo en S3.
+
+# argo get: check-access 14 s, list-missing-maps 2 min, split-tiles 7 s, infer-chunk 4 min.
+# Duracion total del workflow 7 min 49 s. GPU facturada 1 min 54 s (ResourcesDuration).
+
+# main.log
+staged 6 store(s), 0 already present, 0.37 GB in 3.2s (113 MB/s) -> /scratch/cube
+sklearn/base.py:525: InconsistentVersionWarning: Trying to unpickle estimator StandardScaler from version 1.3.1 when using version 1.9.1.
+sklearn/base.py:525: InconsistentVersionWarning: Trying to unpickle estimator PowerTransformer from version 1.3.1 when using version 1.9.1.
+6 tiles of 10 km, years 2000-2026 (27), archive span 1998-2026
+ensemble: 5 seeds, targets ['lcbd_count_sorensen', 'pd_inext_q0', 'pd_inext_q1', 'pd_inext_q2', 'td_inext_q0', 'td_inext_q1', 'td_inext_q2']
+smearing: residuals from /work/assets/models/oof_predictions.csv ([2499, 888, 888, 888, 895, 895, 895] usable per target)
+--jobs 4: 6 tiles -> [2, 2, 1, 1] per worker
+  worker 0 exited 0 after 98s
+  worker 1 exited 0 after 98s
+  worker 2 exited 0 after 98s
+  worker 3 exited 0 after 98s
+merged 4 worker manifests -> /work/out/cube-run1-infer-0/manifest.csv (162 rows)
+
+# worker_*.log, la linea por tesela
+worker 0: [1/2] t2_446: load 1s, 27 years in 59s (pred px/yr median 40190)
+worker 0: [2/2] t2_450: load 0s, 27 years in 24s (pred px/yr median 18283)
+worker 1: [1/2] t2_447: load 1s, 27 years in 54s (pred px/yr median 33709)
+worker 1: [2/2] t2_451: load 0s, 27 years in 22s (pred px/yr median 14226)
+worker 2: [1/1] t2_448: load 1s, 27 years in 71s (pred px/yr median 49146)
+worker 3: [1/1] t2_449: load 1s, 27 years in 26s (pred px/yr median 3991)
+
+# manifest.csv, primeras filas (n_px 110.889 = 333 x 333; load_seconds es la lectura del store)
+tile_id,year,status,n_px,n_native,n_pred,n_dates_window,grid_first,grid_last,seconds,load_seconds,file,error
+t2_446,2000,ok,110889,40843,40831,28,10264.0,11312.0,7.4,1.3,s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/maps/chile_30m_2000_2026/t2_446_2000.tif,
+t2_446,2001,ok,110889,41044,40979,43,10655.0,11680.0,2.3,1.3,s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/maps/chile_30m_2000_2026/t2_446_2001.tif,
+t2_446,2002,ok,110889,41005,40986,46,11079.0,12048.0,1.7,1.3,s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/maps/chile_30m_2000_2026/t2_446_2002.tif,
+
+# 162 GeoTIFF en maps/chile_30m_2000_2026/ (6 teselas x 27 anios), verificado con un listado
+# directo el 2026-09-11.
