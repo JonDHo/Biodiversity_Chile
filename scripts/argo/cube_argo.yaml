@@ -508,21 +508,28 @@ spec:
             - key: eks.amazonaws.com/instance-local-nvme
               operator: Gt
               values: ['100']
-            # Cap the node SIZE. Without this the first real gpu-check landed on a
-            # g4dn.8xlarge: 32 vCPU around a SINGLE T4, of which this pod uses 7. Nothing above
-            # filtered it out -- gpu-count is 1 on every g4dn, so an 8xlarge satisfies every
-            # other requirement and Karpenter is free to take it on spot price or capacity
-            # score. It is ~3x the price of a 2xlarge for exactly the same one card, which is
-            # the "per-unit waste" this project ranks against even when scale-out is cheap.
-            #
-            # Lt 17 means <=16 vCPU, which leaves xlarge, 2xlarge and 4xlarge of every GPU
-            # family and excludes the 8xlarge that the first run picked. It is deliberately NOT
-            # tighter: Karpenter costs the options and takes the cheapest that fits, so the
-            # 2xlarge gets chosen on its own once the pod actually fits one (see the resource
-            # request) -- while leaving a 4xlarge available if 2xlarge spot capacity is not.
-            # Forbidding 4xlarge outright traded a 2x waste for an unschedulable pod, which is
-            # the worse failure: the first attempt at this cap deadlocked with "no instance type
-            # met the scheduling requirements".
+        # Node SIZE is a PREFERENCE, not a requirement, and the split above/below is the whole
+        # lesson from two failed attempts at this.
+        #
+        # The first gpu-check landed on a g4dn.8xlarge: 32 vCPU around a SINGLE T4, ~3x the
+        # price of a 2xlarge for the same one card. Making <=16 vCPU a hard requirement then
+        # made the pod UNSCHEDULABLE -- "no instance type which had enough resources and the
+        # required offering met the scheduling requirements" -- even though six single-GPU
+        # shapes satisfy it on paper (g4dn/g5/g6 2xlarge and 4xlarge). The operative word is
+        # OFFERING: instance type x zone x spot. The small single-GPU shapes simply had no spot
+        # capacity in these zones, while the 32-vCPU one did. That is market weather, and
+        # encoding it as a hard constraint means the run stops whenever the weather changes.
+        #
+        # So: the things above are CORRECTNESS and stay hard -- a v100 would fail at the first
+        # forward (no sm_70 kernels, confirmed in logs/bench_gpu_preflight.log), a multi-GPU
+        # node wastes cards, and without local NVMe staging the cube stops paying. Size is only
+        # COST. Preferring it means Karpenter takes a small node when one exists and a larger
+        # one rather than nothing when none does -- which is the correct trade for a pool that
+        # is spot-only by definition.
+        preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          preference:
+            matchExpressions:
             - key: eks.amazonaws.com/instance-cpu
               operator: Lt
               values: ['17']
@@ -913,9 +920,10 @@ spec:
         # process wants ~1 vCPU for the residue -- so a small GPU with 8 vCPU is the shape that
         # fits (g4dn.2xlarge, g5.2xlarge), not a large or multi-GPU node.
         #
-        # 6 CPU / 20Gi, and BOTH numbers are set by what fits a g4dn.2xlarge rather than by
-        # what the work wants -- which is the whole point, since that 8-vCPU shape is what
-        # docs/21 8.15 asks for.
+        # 6 CPU / 20Gi, sized to fit a g4dn.2xlarge -- the 8-vCPU shape docs/21 8.15 asks for --
+        # while staying honest about what the work needs. Note the node size is only PREFERRED
+        # (see the affinity), so a bigger node is possible when spot has nothing small; this
+        # request is what makes the small one usable when it does.
         #
         # The earlier 7 CPU / 24Gi did not fit one, and that is not arithmetic anyone should
         # trust to intuition: Argo adds ~155m CPU and ~500Mi of its own to the request, so 7
@@ -1024,21 +1032,28 @@ spec:
             - key: eks.amazonaws.com/instance-local-nvme
               operator: Gt
               values: ['100']
-            # Cap the node SIZE. Without this the first real gpu-check landed on a
-            # g4dn.8xlarge: 32 vCPU around a SINGLE T4, of which this pod uses 7. Nothing above
-            # filtered it out -- gpu-count is 1 on every g4dn, so an 8xlarge satisfies every
-            # other requirement and Karpenter is free to take it on spot price or capacity
-            # score. It is ~3x the price of a 2xlarge for exactly the same one card, which is
-            # the "per-unit waste" this project ranks against even when scale-out is cheap.
-            #
-            # Lt 17 means <=16 vCPU, which leaves xlarge, 2xlarge and 4xlarge of every GPU
-            # family and excludes the 8xlarge that the first run picked. It is deliberately NOT
-            # tighter: Karpenter costs the options and takes the cheapest that fits, so the
-            # 2xlarge gets chosen on its own once the pod actually fits one (see the resource
-            # request) -- while leaving a 4xlarge available if 2xlarge spot capacity is not.
-            # Forbidding 4xlarge outright traded a 2x waste for an unschedulable pod, which is
-            # the worse failure: the first attempt at this cap deadlocked with "no instance type
-            # met the scheduling requirements".
+        # Node SIZE is a PREFERENCE, not a requirement, and the split above/below is the whole
+        # lesson from two failed attempts at this.
+        #
+        # The first gpu-check landed on a g4dn.8xlarge: 32 vCPU around a SINGLE T4, ~3x the
+        # price of a 2xlarge for the same one card. Making <=16 vCPU a hard requirement then
+        # made the pod UNSCHEDULABLE -- "no instance type which had enough resources and the
+        # required offering met the scheduling requirements" -- even though six single-GPU
+        # shapes satisfy it on paper (g4dn/g5/g6 2xlarge and 4xlarge). The operative word is
+        # OFFERING: instance type x zone x spot. The small single-GPU shapes simply had no spot
+        # capacity in these zones, while the 32-vCPU one did. That is market weather, and
+        # encoding it as a hard constraint means the run stops whenever the weather changes.
+        #
+        # So: the things above are CORRECTNESS and stay hard -- a v100 would fail at the first
+        # forward (no sm_70 kernels, confirmed in logs/bench_gpu_preflight.log), a multi-GPU
+        # node wastes cards, and without local NVMe staging the cube stops paying. Size is only
+        # COST. Preferring it means Karpenter takes a small node when one exists and a larger
+        # one rather than nothing when none does -- which is the correct trade for a pool that
+        # is spot-only by definition.
+        preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          preference:
+            matchExpressions:
             - key: eks.amazonaws.com/instance-cpu
               operator: Lt
               values: ['17']
