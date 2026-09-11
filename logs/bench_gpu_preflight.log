@@ -32,3 +32,39 @@ Las cifras de /scratch son de un 8xlarge con 2 x 900 GB de NVMe, probablemente e
 RAID0. Tras acotar el nodo a instance-cpu < 16 la inferencia va a correr en un
 g4dn.2xlarge, que trae 1 x 225 GB: se espera menos throughput, y basta con que quede
 por encima de ~700 MB/s. La proxima corrida de gpu-check lo dice.
+
+=== segunda corrida, 2026-09-11 (biodiv-cube-z5k8n) ===
+Con el tamanio del nodo como PREFERENCIA en vez de requisito. Cayo otra vez en un
+g4dn.8xlarge, que confirma el diagnostico: no hay capacidad spot de las formas chicas de
+una sola GPU en estas zonas, y la preferencia se relaja como corresponde en vez de
+dejar el pod sin agendar.
+
+torch 2.14.0+cu130, Tesla T4, sm_75 en la lista, matmul ok
+/scratch write 1000 MB/s, cold read 519 MB/s
+GPU PREFLIGHT OK
+
+El disco varia MUCHO entre corridas del mismo tipo de instancia: 2.460 MB/s en la
+primera contra 519 en la segunda, 4,7x. El nodo tiene un solo NVMe de 900 GB
+(ephemeral-storage capacity 878477088Ki ~= 838 GiB), asi que no es cuestion de striping
+sino de estado del dispositivo o de vecinos ruidosos. Lo que importa es que las dos
+cifras dejan a staging ganando:
+
+  2.460 MB/s -> leer 0,44-0,58 s -> 3,3 s por tesela -> 2,5x contra leer directo de S3
+    519 MB/s -> leer 0,65-1,09 s -> 3,8 s por tesela -> 2,2x
+
+Salvedad: la prueba es de un solo hilo. A --jobs 4 hay cuatro lectores compartiendo el
+dispositivo, y como escala un NVMe con la profundidad de cola no se midio.
+
+=== datos del nodo, utiles para dimensionar (de kubectl describe node) ===
+Bottlerocket (EKS Auto, Nvidia), kernel 6.12.95, containerd 2.2.7.
+32 vCPU con 31700m asignables -- o sea 300m de overhead del kubelet, muy poco.
+DaemonSets del nodo: 155m de CPU y 372Mi en total (node-exporter 5m/12Mi, el provider
+de secrets-store 50m/100Mi, secrets-store-csi 70m/140Mi, efs-csi 0, s3-csi 30m/120Mi).
+
+**Eso corrige un diagnostico de esta sesion.** Se habia atribuido el 8xlarge de la
+primera corrida a que el pedido de 7 CPU / 24Gi no entraba en un 2xlarge una vez
+contados Argo y los DaemonSets. Es falso: los DaemonSets son 155m, no los 500-1000m
+supuestos, y extrapolado a 8 vCPU quedan ~7645m agendables, asi que los 7155m entraban
+de sobra. Tanto el 8xlarge como el pod sin agendar posterior fueron, los dos, capacidad
+de offering de spot. Pedir colchon en este cluster es mas barato de lo que la intuicion
+sugiere.

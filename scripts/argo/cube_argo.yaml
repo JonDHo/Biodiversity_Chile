@@ -430,11 +430,18 @@ spec:
             mb = n / 1e6
             print(f"/scratch write {mb / wrote:.0f} MB/s, cold read {mb / read:.0f} MB/s",
                   flush=True)
-            # ~700 MB/s is where the read stops being I/O-bound (docs/21 8.16). Below it,
-            # staging roughly ties reading from S3, so it is wasted effort but not a failure.
-            print("/scratch verdict:", "NVMe-class, staging wins" if mb / read > 500 else
-                  "SLOW for an NVMe request -- staging only ties reading from S3; check "
-                  "whether the NodeClass puts the instance store on the kubelet dataroot",
+            # Three bands, because a single cutoff was misleading: the first version said
+            # "staging wins" at >500 MB/s while the analysis in docs/21 8.16 uses ~700 MB/s as
+            # the point where the read stops being I/O-bound. Both were defensible and they
+            # disagreed, which is worse than either. Measured single-stream, and note that
+            # --jobs 4 will have four readers sharing whatever the device gives.
+            r = mb / read
+            print("/scratch verdict:",
+                  "NVMe-class; the read is decompression-bound, staging is at its best" if r > 700
+                  else "usable NVMe; the read is partly I/O-bound but staging still beats "
+                       "reading from S3 by ~2x" if r > 200
+                  else "SLOW -- staging only ties reading from S3. Check whether the NodeClass "
+                       "puts the instance store on the kubelet dataroot",
                   flush=True)
         except Exception as e:
             print(f"/scratch probe skipped: {type(e).__name__}: {e}", flush=True)
@@ -920,23 +927,21 @@ spec:
         # process wants ~1 vCPU for the residue -- so a small GPU with 8 vCPU is the shape that
         # fits (g4dn.2xlarge, g5.2xlarge), not a large or multi-GPU node.
         #
-        # 6 CPU / 20Gi, sized to fit a g4dn.2xlarge -- the 8-vCPU shape docs/21 8.15 asks for --
-        # while staying honest about what the work needs. Note the node size is only PREFERRED
-        # (see the affinity), so a bigger node is possible when spot has nothing small; this
-        # request is what makes the small one usable when it does.
-        #
-        # The earlier 7 CPU / 24Gi did not fit one, and that is not arithmetic anyone should
-        # trust to intuition: Argo adds ~155m CPU and ~500Mi of its own to the request, so 7
-        # became 7155m against ~7910m allocatable, and the node's DaemonSets (CNI, kube-proxy,
-        # NVIDIA device plugin, logging) claim several hundred more. The result was first a
-        # silent upgrade to a g4dn.8xlarge -- 32 vCPU around one T4 -- and then, once the cap
-        # forbade that, an unschedulable pod. 6 CPU leaves room for ~1000m of DaemonSets.
-        #
-        # The work needs far less than either: from the cube there is no COG load transient at
-        # all, the array is ~820 MB per process and the interpolation was cut to 294 MiB
-        # (docs/21 8.8), so four processes sit near ~8 GB. --jobs 4 wants ~4 processes at ~1
-        # vCPU each plus residue, so 6 is right-sized and not a sacrifice. The remaining ~12 GiB
+        # 6 CPU / 20Gi: what the work needs, with margin, on the smallest shape we would want.
+        # --jobs 4 wants ~4 processes at ~1 vCPU each plus residue, and from the cube there is no
+        # COG load transient at all -- the array is ~820 MB per process and the interpolation was
+        # cut to 294 MiB (docs/21 8.8), so four processes sit near ~8 GB. The remaining ~12 GiB
         # is headroom for the page cache holding the staged cube (~6 GB at 18 tiles).
+        #
+        # A CORRECTION worth keeping, because the wrong version of it was in this file: the
+        # earlier 7 CPU / 24Gi request was NOT why the first run landed on a g4dn.8xlarge. A real
+        # node description settled it -- on Bottlerocket (EKS Auto) a 32 vCPU node reports 31700m
+        # allocatable, i.e. only 300m of kubelet overhead, and the DaemonSets here total just
+        # 155m CPU / 372Mi (node-exporter, the two secrets-store CSI pods, efs-csi, s3-csi). Not
+        # the 500-1000m assumed. Extrapolated to an 8 vCPU node that leaves ~7645m schedulable,
+        # so 7155m fitted comfortably. Both the 8xlarge and the later unschedulable pod were
+        # purely spot OFFERING availability, which is what the affinity comment now says.
+        # Sizing headroom on this cluster is therefore cheaper than intuition suggests.
         limits: {cpu: '6', memory: 20Gi, nvidia.com/gpu: 1}
         requests: {cpu: '6', memory: 20Gi, nvidia.com/gpu: 1}
       volumeMounts:

@@ -1110,13 +1110,22 @@ un pool de hilos —2,7 s por tesela— mientras que cuatro procesos leyendo chu
 pisan y pagan 8,3 s cada uno contra los 3,1 s que cuesta en solitario.
 
 **Confirmado en el cluster (2026-09-11, `logs/bench_gpu_preflight.log`).** El `emptyDir` sí cae
-sobre el NVMe: `gpu-preflight` midió **1.026 MB/s de escritura y 2.460 MB/s de lectura en frío**,
-muy por encima de los ~700 MB/s en que la lectura vuelve a estar limitada por descompresión. O
-sea que en el cluster aplica la fila "en caliente" de la tabla de arriba —~3,2 s por tesela
-contra 8,3 s leyendo directo, **2,6x**— y no la fila fría. La salvedad es que esa corrida cayó en
-un `g4dn.8xlarge` con 2 × 900 GB de NVMe; tras acotar el nodo a `instance-cpu < 16` la inferencia
-correrá en un `g4dn.2xlarge` con 1 × 225 GB, donde cabe esperar menos y basta con superar los
-~700 MB/s.
+sobre el NVMe —el nodo reporta 838 GiB de `ephemeral-storage`, que es su único disco de 900 GB—,
+pero **el throughput varía mucho entre corridas del mismo tipo de instancia**: dos `gpu-check`
+sobre `g4dn.8xlarge` midieron 2.460 y 519 MB/s de lectura en frío, 4,7x de diferencia, con la
+escritura estable en ~1.000. No es striping, es estado del dispositivo o vecinos ruidosos. Lo que
+importa es que **las dos cifras dejan a staging ganando**:
+
+| lectura en frío de `/scratch` | leer una tesela | por tesela a `--jobs 4` | contra leer directo |
+|---|---|---:|---:|
+| 2.460 MB/s | 0,44-0,58 s | 3,3 s | **2,5x** |
+| 519 MB/s | 0,65-1,09 s | 3,8 s | **2,2x** |
+
+Así que el rango medido en el cluster cae entre la fila "en caliente" de la tabla anterior y algo
+apenas peor, nunca cerca de la fila fría de 134 MB/s. Dos salvedades: la prueba es de **un solo
+hilo**, y a `--jobs 4` hay cuatro lectores compartiendo el dispositivo —cómo escala un NVMe con la
+profundidad de cola no se midió—; y las dos corridas cayeron en un `g4dn.8xlarge`, porque no hay
+capacidad spot de las formas chicas de una sola GPU en estas zonas.
 
 Y en producción la lectura probablemente esté **en caliente de todos modos**: 18 teselas son ~6 GB
 bajados, el pod tiene un límite de 24Gi y el trabajo usa ~8 GB, así que el cubo bajado entra en el
