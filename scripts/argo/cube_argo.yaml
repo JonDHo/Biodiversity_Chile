@@ -54,10 +54,10 @@
 # ---------------------------------------------------------------------
 # UNVERIFIED FROM OUTSIDE THE CLUSTER -- check these two before the first submit
 # ---------------------------------------------------------------------
-#  1. The GPU scheduling hints. The arch is pinned to amd64 (the images have no arm64
-#     variant) and the standard NVIDIA taint is tolerated, but whether this cluster ALSO
-#     wants a GPU-specific node label cannot be read from a CPU pod. gpu-preflight is a
-#     one-minute, one-pod test of exactly this.
+#  1. The GPU scheduling hints -- the LAST unverified thing here. The arch is pinned to amd64
+#     (verified: the image index holds only linux/amd64) and the standard NVIDIA taint is
+#     tolerated, but whether this cluster ALSO wants a GPU-specific node label cannot be read
+#     from a CPU pod. gpu-preflight is a one-minute, one-pod test of exactly this.
 #  2. cuda-tag is set to 13-2-1 and gpu-image-tag to develop.latest; both were confirmed to
 #     exist on 2026-09-11. Neither is something this file can re-check for itself, and
 #     develop.latest moves, so if GPU pods fail to pull that is the first thing to look at --
@@ -125,9 +125,12 @@ spec:
     # so develop.latest is right even though some PR tags are newer. It is a moving tag: it
     # will point at something else after the next merge, which is what gpu-preflight is for.
     #
-    # The bare tag is the manifest index; every tag also exists as `<tag>-amd64`, and there is
-    # NO arm64 variant. Use the bare tag (the index resolves to the platform image), but see
-    # the nodeSelector on the GPU templates: amd64-only images are why it is pinned.
+    # Verified with `skopeo inspect --raw` on 2026-09-11, not inferred: the bare tag is an OCI
+    # index (application/vnd.oci.image.index.v1+json) holding exactly ONE real platform,
+    # linux/amd64, plus an attestation manifest (architecture "unknown" -- that is the third,
+    # untagged entry per push that a describe-images listing shows). So the bare tag is the
+    # right one to use, and there being no arm64 image is exactly why the GPU templates pin
+    # kubernetes.io/arch: amd64 -- an arm64 node would fail the pull, not the CUDA call.
     - name: gpu-image-tag
       value: develop.latest
     - name: aws-image
