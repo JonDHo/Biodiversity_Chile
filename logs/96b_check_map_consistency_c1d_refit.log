@@ -1,0 +1,20 @@
+### 2026-09-11T18:58:16+00:00 :: scripts/74 sobre checkpoints refit
+5 checkpoints; targets ['lcbd_count_sorensen', 'pd_inext_q0', 'pd_inext_q1', 'pd_inext_q2', 'td_inext_q0', 'td_inext_q1', 'td_inext_q2']
+3102 plots, C1D inputs (3102, 1, 100), ctx (3102, 13)
+PASS  scaler round trip, max rel err per target [3.18968992e-13 1.71546715e-14 1.13334879e-15 9.76175700e-16
+ 3.35633722e-13 1.12015387e-15 6.16263618e-15]
+PASS  context rows identical (max abs diff 0.00e+00, NaN pattern equal True)
+PASS  curve1d inputs identical (max abs diff 0.00e+00, 3102 plots with a curve)
+PASS  seed-0 forward pass identical (max abs diff 0.00e+00)
+smearing residuals from results/models_unified_topofix/C1D01_curve1d_kndvi_raw100_pg-all_unified_ctr/kfold5_block20_unified/oof_predictions.csv; block-CV reference R2 recomputed from it
+             target    n  r2_plain  r2_smeared  r2_blockcv  pred_max   obs_max
+lcbd_count_sorensen 2499     0.480       0.476       0.420  0.000434  0.000441
+        pd_inext_q0  888     0.644       0.656       0.602 16.723946 26.564060
+        pd_inext_q1  888     0.140       0.069       0.027  4.388215  9.083144
+        pd_inext_q2  888     0.167       0.163       0.076  3.505105  6.113724
+        td_inext_q0  895     0.594       0.813       0.781 44.742283 83.980788
+        td_inext_q1  895     0.186       0.158      -0.136  7.657155 28.836624
+        td_inext_q2  895     0.095       0.063      -0.080  4.354897 14.469542
+PASS  in-sample (smeared) R2 on PD0/TD0 not more than 0.05 below the block-CV reference (gaps [0.054, 0.032])
+
+ALL PASS
