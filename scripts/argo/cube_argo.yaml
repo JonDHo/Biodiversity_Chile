@@ -14,6 +14,10 @@
 #                on build-chunk, so NO tile is inferred until EVERY tile is built.
 #   build-only   the construction pass alone (`argo submit --entrypoint build-only`)
 #   infer-only   inference alone, against whatever the cube already holds
+#   gpu-check    one pod on one GPU node and nothing else -- the smoke test to run FIRST
+#
+# NOTE ON limit-tiles: 0 means NO CAP, i.e. every missing tile, not "none". To try a small run
+# set it to a small number (e.g. 6), never to 0.
 #
 # **On overlapping the two.** The stages are 1-to-1 per tile, so waiting for the whole build is
 # not technically necessary, and the wall-time case for overlapping is real: total goes from
@@ -262,6 +266,27 @@ spec:
           parameters:
           - name: chunk-id
             value: '{{item}}'
+
+  # The cheapest possible test of the GPU half: ONE pod on ONE GPU node, nothing else.
+  #
+  #   argo submit -n easi-workflows-argo scripts/argo/cube_argo.yaml --entrypoint gpu-check
+  #
+  # Deliberately has no other tasks -- no check-access, no tile list, no S3 assets, no git-sync
+  # -- so it needs nothing staged and cannot fail for a reason unrelated to the GPU. What it
+  # proves, all of which is otherwise only discovered at the END of a `main` run:
+  #   - dask-gpu-worker-node-pool admits a non-dask pod (both taints tolerated, label matched)
+  #   - the nodeAffinity resolves to a real instance (no v100, single GPU, local NVMe)
+  #   - the image name built from cuda-tag exists and pulls
+  #   - torch sees the card AND has kernels for its compute capability, with a real matmul
+  #   - how fast /scratch actually is, which decides whether staging the cube is worth 4,3 %
+  #     of a tile or 6,9 % (docs/21 8.16)
+  # Run this BEFORE the build smoke test: it is faster, cheaper, and answers the only things
+  # about this workflow that were never verifiable from a CPU pod.
+  - name: gpu-check
+    dag:
+      tasks:
+      - name: gpu-preflight
+        template: gpu-preflight
 
   - name: build-only
     dag:
