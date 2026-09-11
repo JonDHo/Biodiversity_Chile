@@ -98,8 +98,10 @@ spec:
     - name: gpu-registry
       value: 444488357543.dkr.ecr.us-west-2.amazonaws.com
     # NOTE THE HYPHENS: the CUDA version appears as 13-2-1, not 13.2.1, because it is part of
-    # a repository name. 13-2-1 was current on 2026-09-11; it moves, so check before a run
-    # after a long gap. It is not discoverable from a Jupyter pod -- the registry is in account
+    # a repository name. On 2026-09-11 it was confirmed to be the ONLY CUDA version built in
+    # this registry, and to be in regular use by the team -- so it is the right default and
+    # there is nothing to fall back TO. If gpu-preflight ever rejects it, the remedy is a
+    # different small GPU node rather than a different image; see the note there. It is not discoverable from a Jupyter pod -- the registry is in account
     # 444488357543 while the notebook role lives in 262301216538, so ecr:DescribeRepositories
     # is denied cross-account. To re-check, with credentials for the workflows account:
     #
@@ -320,11 +322,15 @@ spec:
   # run on the card it lands on. Under `main` the GPU pods are otherwise the LAST thing to
   # run, so without this any of the three would surface with the whole cube already built.
   #
-  # The arch check is the non-obvious one. `cuda-tag` moves over time and newer CUDA releases
-  # drop older GPU architectures, so an image can pull cleanly, see the card, and still have
-  # no kernels for it -- torch then fails at the first forward with "no kernel image is
-  # available for execution on the device", which is a confusing error to meet at hour six.
-  # A T4 is compute capability 7.5; get_arch_list() is what says whether this build has it.
+  # The arch check is the non-obvious one, and it is cheap insurance rather than an expected
+  # problem: the team uses this image regularly, so it is already known to work on the GPUs
+  # they run. It stays because the failure mode is nasty and the test is a minute -- newer CUDA
+  # releases drop older GPU architectures, so an image can pull cleanly, see the card, and
+  # still have no kernels for it, and torch then fails at the FIRST FORWARD with "no kernel
+  # image is available for execution on the device". At hour six of a run that error does not
+  # look like an image problem. A T4 is compute capability 7.5; get_arch_list() settles it in
+  # advance. If it ever does fail, the fix is a different small GPU node (an A10G on g5 is
+  # sm_86), since 13-2-1 was the only CUDA version in this registry on 2026-09-11.
   - name: gpu-preflight
     activeDeadlineSeconds: '900'
     container:
@@ -343,8 +349,16 @@ spec:
         print(f"device: {name}  capability sm_{cap[0]}{cap[1]}", flush=True)
         print(f"kernels built for: {archs}", flush=True)
         if f"sm_{cap[0]}{cap[1]}" not in archs:
-            sys.exit(f"this torch has no kernels for sm_{cap[0]}{cap[1]} ({name}). Pick an "
-                     f"older cuda-tag, or a GPU this build supports.")
+            # Unlikely -- this image is in regular use by the team -- but if it happens
+            # there is no older cuda-tag to drop back to, since 13-2-1 was the only CUDA
+            # version in this registry on 2026-09-11. The remedy is a different small GPU
+            # node: a T4 is sm_75 (g4dn), an A10G is sm_86 (g5), and both come in an 8-vCPU
+            # size that fits the 7 cores this workflow asks for. docs/21 8.15 found a bigger
+            # card buys nothing, so that would be a compatibility choice rather than a
+            # performance one -- and it moves the cost arithmetic in that section.
+            sys.exit(f"this torch has no kernels for sm_{cap[0]}{cap[1]} ({name}), and no "
+                     f"older CUDA image exists to fall back to. Needs a GPU family in "
+                     f"{archs} -- or a new image built for sm_{cap[0]}{cap[1]}.")
         # Actually run something, because is_available() alone has never proven a kernel runs.
         a = torch.randn(256, 256, device="cuda")
         print("matmul ok:", float((a @ a).sum()) == float((a @ a).sum()), flush=True)
