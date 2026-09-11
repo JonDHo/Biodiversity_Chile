@@ -1,7 +1,7 @@
 # biodiv-cube -- build the materialised kNDVI cube, then infer from it.
 #
 #   argo submit -n easi-workflows-argo scripts/argo/cube_argo.yaml \
-#     -p limit-tiles=90 -p num-chunks=5
+#     -p limit-tiles=90 -p num-batches=5
 #
 # This is `docs/24` Option A: one construction pass on cheap CPU, then all inference against
 # the cube on a small GPU node. It is SEPARATE from process_argo.yaml, which stays as the
@@ -10,8 +10,8 @@
 # ---------------------------------------------------------------------
 # Three entrypoints, because the two stages are worth running apart
 # ---------------------------------------------------------------------
-#   main         build everything, then infer. The default, and biphasic: infer-chunk depends
-#                on build-chunk, so NO tile is inferred until EVERY tile is built.
+#   main         build everything, then infer. The default, and biphasic: infer-batch depends
+#                on build-batch, so NO tile is inferred until EVERY tile is built.
 #   build-only   the construction pass alone (`argo submit --entrypoint build-only`)
 #   infer-only   inference alone, against whatever the cube already holds
 #   gpu-check    one pod on one GPU node and nothing else -- the smoke test to run FIRST
@@ -39,13 +39,13 @@
 # ---------------------------------------------------------------------
 # What each stage costs, measured
 # ---------------------------------------------------------------------
-# build-chunk  ~360 s/tile (27 years, ~1.850 dates). Measured 0,186 s/date in the pod (`docs/21`
+# build-batch  ~360 s/tile (27 years, ~1.850 dates). Measured 0,186 s/date in the pod (`docs/21`
 #              8.18), so a coastal tile with 600 dates takes ~110 s. The scheduler is
 #              `--workers 7`, NOT the `--load-threads` that process_argo.yaml uses: that setting
 #              is tuned around the CNN competing with the cluster's workers, and this pass has
 #              no CNN. Measured 688,8 s -> 292,2 s, 2,36x, rasters bit-identical between the
 #              two (`docs/21` 8.17).
-# infer-chunk  ~70 s/tile at --jobs 4 on one T4, from the cube (`docs/21` 8.15) -- but the cost
+# infer-batch  ~70 s/tile at --jobs 4 on one T4, from the cube (`docs/21` 8.15) -- but the cost
 #              is per PREDICTED PIXEL, ~22 s + ~1,0 ms per masked-in pixel over 27 years
 #              (`docs/21` 8.19), so 70 s is a tile with ~45.000 native-vegetation pixels and a
 #              fully vegetated one is ~120 s. The stores are pulled to node-local disk first by
@@ -92,7 +92,7 @@ metadata:
 spec:
   arguments:
     parameters:
-    # Only build-chunk needs this one. `import biodiv.maptask` pulls torch in through
+    # Only build-batch needs this one. `import biodiv.maptask` pulls torch in through
     # mapinfer -- verified, not assumed -- so the build pod cannot use the light image even
     # though the build itself never runs a model. Making mapinfer's torch import lazy would
     # free it, which is worth considering if spot churn makes pod startup matter: the build
@@ -177,8 +177,8 @@ spec:
       value: cube-run1
     - name: limit-tiles
       value: '90'
-    - name: num-chunks
-      value: '5'
+    - name: num-batches
+      value: '15'
     - name: build-workers
       value: '7'
     - name: infer-jobs
@@ -188,14 +188,14 @@ spec:
     - name: infer-deadline-seconds
       value: '7200'
     # NOTE ON SPOT. dask-gpu-worker-node-pool is spot-only, with expireAfter 12h and a 10m
-    # termination grace period, so an inference pod can lose its node mid-chunk. Three things
+    # termination grace period, so an inference pod can lose its node mid-batch. Three things
     # already absorb that, which is why it is acceptable rather than merely tolerated:
     #   - scripts/73 --resume treats a tile-year as done once its GeoTIFF is in S3, so a
-    #     reclaimed pod loses at most the tile in flight, not the chunk;
-    #   - retryStrategy limit 2 on infer-chunk reschedules it;
+    #     reclaimed pod loses at most the tile in flight, not the batch;
+    #   - retryStrategy limit 2 on infer-batch reschedules it;
     #   - stage_cube.py skips stores already present, though a retry landing on a NEW node
     #     re-stages from S3 (~49 s for 18 tiles), since the scratch emptyDir dies with the node.
-    # The 2h deadline sits inside the 12h node expiry, so expiry should never cut a chunk.
+    # The 2h deadline sits inside the 12h node expiry, so expiry should never cut a batch.
     # karpenter.sh/do-not-disrupt on the pod blocks Karpenter's VOLUNTARY disruption
     # (consolidation, drift, expiry); it cannot block a spot reclaim, which is involuntary.
   artifactGC:
@@ -211,11 +211,11 @@ spec:
   # ---------------- DAGs ----------------
   - name: main
     dag:
-      # One bad build chunk does not cancel the others, which are independent; the build is
+      # One bad build batch does not cancel the others, which are independent; the build is
       # fully resumable, so a partial pass is worth keeping.
       #
       # No GPU preflight in the run itself: the node it would test is released before
-      # infer-chunk provisions its own, and the scheduling constraints on infer-chunk are what
+      # infer-batch provisions its own, and the scheduling constraints on infer-batch are what
       # guarantee the shape. The standalone smoke test is `--entrypoint gpu-check`.
       failFast: false
       tasks:
@@ -235,24 +235,24 @@ spec:
           artifacts:
           - name: missing-csv
             from: '{{tasks.list-to-build.outputs.artifacts.missing-csv}}'
-      - name: build-chunk
-        template: build-chunk
+      - name: build-batch
+        template: build-batch
         depends: split-build
-        withParam: '{{tasks.split-build.outputs.parameters.chunk-ids}}'
+        withParam: '{{tasks.split-build.outputs.parameters.batch-ids}}'
         arguments:
           artifacts:
-          - name: chunks
-            from: '{{tasks.split-build.outputs.artifacts.chunks}}'
+          - name: batches
+            from: '{{tasks.split-build.outputs.artifacts.batches}}'
           parameters:
-          - name: chunk-id
+          - name: batch-id
             value: '{{item}}'
-      # THE BARRIER. This one `depends` is what makes the run biphasic; every build-chunk pod
+      # THE BARRIER. This one `depends` is what makes the run biphasic; every build-batch pod
       # must finish before any inference starts. Removing it is not the way to overlap -- use
       # --entrypoint infer-only in a second submission instead, so the two stages keep their
       # own deadlines, parallelism and retries.
       - name: list-missing-maps
         template: list-missing-maps
-        depends: build-chunk
+        depends: build-batch
       - name: split-infer
         template: split-tiles
         depends: list-missing-maps
@@ -260,16 +260,16 @@ spec:
           artifacts:
           - name: missing-csv
             from: '{{tasks.list-missing-maps.outputs.artifacts.missing-csv}}'
-      - name: infer-chunk
-        template: infer-chunk
+      - name: infer-batch
+        template: infer-batch
         depends: split-infer
-        withParam: '{{tasks.split-infer.outputs.parameters.chunk-ids}}'
+        withParam: '{{tasks.split-infer.outputs.parameters.batch-ids}}'
         arguments:
           artifacts:
-          - name: chunks
-            from: '{{tasks.split-infer.outputs.artifacts.chunks}}'
+          - name: batches
+            from: '{{tasks.split-infer.outputs.artifacts.batches}}'
           parameters:
-          - name: chunk-id
+          - name: batch-id
             value: '{{item}}'
 
   # The cheapest possible test of the GPU half: ONE pod on ONE GPU node, nothing else.
@@ -312,16 +312,16 @@ spec:
           artifacts:
           - name: missing-csv
             from: '{{tasks.list-to-build.outputs.artifacts.missing-csv}}'
-      - name: build-chunk
-        template: build-chunk
+      - name: build-batch
+        template: build-batch
         depends: split-build
-        withParam: '{{tasks.split-build.outputs.parameters.chunk-ids}}'
+        withParam: '{{tasks.split-build.outputs.parameters.batch-ids}}'
         arguments:
           artifacts:
-          - name: chunks
-            from: '{{tasks.split-build.outputs.artifacts.chunks}}'
+          - name: batches
+            from: '{{tasks.split-build.outputs.artifacts.batches}}'
           parameters:
-          - name: chunk-id
+          - name: batch-id
             value: '{{item}}'
 
   - name: infer-only
@@ -343,16 +343,16 @@ spec:
           artifacts:
           - name: missing-csv
             from: '{{tasks.list-missing-maps.outputs.artifacts.missing-csv}}'
-      - name: infer-chunk
-        template: infer-chunk
+      - name: infer-batch
+        template: infer-batch
         depends: split-infer
-        withParam: '{{tasks.split-infer.outputs.parameters.chunk-ids}}'
+        withParam: '{{tasks.split-infer.outputs.parameters.batch-ids}}'
         arguments:
           artifacts:
-          - name: chunks
-            from: '{{tasks.split-infer.outputs.artifacts.chunks}}'
+          - name: batches
+            from: '{{tasks.split-infer.outputs.artifacts.batches}}'
           parameters:
-          - name: chunk-id
+          - name: batch-id
             value: '{{item}}'
 
   # ---------------- steps ----------------
@@ -360,7 +360,7 @@ spec:
   # that nothing else here can check: that the image name resolves and pulls, that the
   # scheduling hints actually get this workflow a GPU, and that the torch in that image can
   # run on the card it lands on. Only the gpu-check entrypoint runs it: inside `main` or
-  # infer-only it would test a node that is gone by the time infer-chunk gets its own.
+  # infer-only it would test a node that is gone by the time infer-batch gets its own.
   #
   # The arch check is the non-obvious one, and it is cheap insurance rather than an expected
   # problem: the team uses this image regularly, so it is already known to work on the GPUs
@@ -382,7 +382,7 @@ spec:
         print("torch", torch.__version__, "built for CUDA", torch.version.cuda, flush=True)
         if not torch.cuda.is_available():
             sys.exit("no CUDA device visible: the pod did not get a GPU, or the image "
-                     "cannot see it. Check the toleration/nodeSelector on infer-chunk.")
+                     "cannot see it. Check the toleration/nodeSelector on infer-batch.")
         name = torch.cuda.get_device_name(0)
         cap = torch.cuda.get_device_capability(0)
         archs = torch.cuda.get_arch_list()
@@ -452,7 +452,7 @@ spec:
             except OSError: pass
         print("GPU PREFLIGHT OK", flush=True)
       resources:
-        # Deliberately the SAME request as infer-chunk, so the preflight provisions the shape
+        # Deliberately the SAME request as infer-batch, so the preflight provisions the shape
         # inference will actually get rather than a different one. Karpenter brings up a whole
         # node either way, so asking for this costs nothing and the pod lives about a minute.
         limits: {cpu: '6', memory: 20Gi, nvidia.com/gpu: 1}
@@ -502,12 +502,12 @@ spec:
             # 3,1 s solo), staging costs 2,7 s of transfer plus 0,47 s to read back warm or
             # 2,50 s genuinely cold on a ~134 MB/s disk. So staging wins either way -- 2,6x warm,
             # 1,6x cold -- and NVMe buys the difference between those two. It also covers the
-            # case where a chunk outgrows the page cache, which at the default 18 tiles it does
+            # case where a batch outgrows the page cache, which at the default 18 tiles it does
             # not: ~6 GB staged against a 24Gi limit with ~8 GB of work. Every shape that
             # survives the two filters above
             # (g4dn, g5, g6, g6e) carries >=125 GB of it, so this narrows nothing in practice;
             # it excludes p3, which is EBS-only, and which the v100 filter already excluded.
-            # 100 GB leaves room for a CUDA image plus the staged chunk several times over.
+            # 100 GB leaves room for a CUDA image plus the staged batch several times over.
             #
             # CAVEAT: this guarantees the INSTANCE has NVMe, not that the emptyDir lands on it
             # -- that depends on the NodeClass wiring the instance store into the kubelet's
@@ -552,7 +552,7 @@ spec:
       effect: NoSchedule
     retryStrategy: {limit: 1, retryPolicy: OnError}
     volumes:
-    # Same kind of volume infer-chunk stages the cube into, so the probe above measures the
+    # Same kind of volume infer-batch stages the cube into, so the probe above measures the
     # thing that will actually hold it. Small: the probe writes 1,5 GB.
     - name: scratch
       emptyDir:
@@ -718,8 +718,8 @@ spec:
 
         rows = list(csv.reader(open("/work/missing_tiles.csv")))
         header, rows = rows[0], rows[1:]
-        n = int(os.environ["NUM_CHUNKS"])
-        os.makedirs("/work/chunks", exist_ok=True)
+        n = int(os.environ["NUM_BATCHES"])
+        os.makedirs("/work/batches", exist_ok=True)
         size = math.ceil(len(rows) / n) if rows else 0
         ids = []
         for i in range(n):
@@ -727,14 +727,14 @@ spec:
             if not part:
                 continue
             ids.append(str(i))
-            with open(f"/work/chunks/chunk_{i}.csv", "w", newline="") as f:
+            with open(f"/work/batches/batch_{i}.csv", "w", newline="") as f:
                 w = csv.writer(f)
                 w.writerow(header)
                 w.writerows(part)
-        json.dump(ids, open("/work/chunk_ids.json", "w"))
+        json.dump(ids, open("/work/batch_ids.json", "w"))
       env:
-      - name: NUM_CHUNKS
-        value: '{{workflow.parameters.num-chunks}}'
+      - name: NUM_BATCHES
+        value: '{{workflow.parameters.num-batches}}'
       resources:
         limits: {cpu: 500m, memory: 512Mi}
         requests: {cpu: 500m, memory: 512Mi}
@@ -742,11 +742,11 @@ spec:
       - {mountPath: /work, name: work}
     outputs:
       artifacts:
-      - name: chunks
-        path: /work/chunks
+      - name: batches
+        path: /work/batches
       parameters:
-      - name: chunk-ids
-        valueFrom: {path: /work/chunk_ids.json}
+      - name: batch-ids
+        valueFrom: {path: /work/batch_ids.json}
     volumes:
     - {name: work, emptyDir: {}}
     archiveLocation:
@@ -756,14 +756,14 @@ spec:
         endpoint: s3.amazonaws.com
         key: easi-workflows-team/biodiv/argo-artifacts/{{workflow.name}}/{{pod.name}}
 
-  - name: build-chunk
+  - name: build-batch
     activeDeadlineSeconds: '{{workflow.parameters.build-deadline-seconds}}'
     inputs:
       artifacts:
-      - name: chunks
-        path: /work/chunks
+      - name: batches
+        path: /work/batches
       parameters:
-      - name: chunk-id
+      - name: batch-id
     container:
       image: '{{workflow.parameters.base-image}}'
       command: [bash, -c]
@@ -773,18 +773,18 @@ spec:
         set -uo pipefail
         rc=0
         python scripts/75_build_cube.py \
-          --tiles-file "/work/chunks/chunk_{{inputs.parameters.chunk-id}}.csv" \
+          --tiles-file "/work/batches/batch_{{inputs.parameters.batch-id}}.csv" \
           --cube "{{workflow.parameters.s3-cube}}" \
           --years "{{workflow.parameters.years}}" \
           --workers "{{workflow.parameters.build-workers}}" \
           --resume \
           --out /work/out \
-          --tag "{{workflow.parameters.tag}}-build-{{inputs.parameters.chunk-id}}" || rc=$?
+          --tag "{{workflow.parameters.tag}}-build-{{inputs.parameters.batch-id}}" || rc=$?
         # The manifest is the only per-tile record of which tiles failed and why; without this
         # copy it dies with the pod and the stores in S3 have no provenance. Uploaded whether
-        # or not the pass succeeded -- a failed chunk is exactly when it is worth having.
+        # or not the pass succeeded -- a failed batch is exactly when it is worth having.
         python scripts/argo/upload_run_evidence.py /work/out \
-          "{{workflow.parameters.s3-cube}}/_runs/{{workflow.name}}/chunk-{{inputs.parameters.chunk-id}}" \
+          "{{workflow.parameters.s3-cube}}/_runs/{{workflow.name}}/batch-{{inputs.parameters.batch-id}}" \
           || echo "WARNING: run evidence was not uploaded" >&2
         exit $rc
       env:
@@ -853,14 +853,14 @@ spec:
         endpoint: s3.amazonaws.com
         key: easi-workflows-team/biodiv/argo-artifacts/{{workflow.name}}/{{pod.name}}
 
-  - name: infer-chunk
+  - name: infer-batch
     activeDeadlineSeconds: '{{workflow.parameters.infer-deadline-seconds}}'
     inputs:
       artifacts:
-      - name: chunks
-        path: /work/chunks
+      - name: batches
+        path: /work/batches
       parameters:
-      - name: chunk-id
+      - name: batch-id
     container:
       image: '{{workflow.parameters.gpu-registry}}/easi-workflows-base-nvidia-{{workflow.parameters.cuda-tag}}-torch-cudnn-runtime:{{workflow.parameters.gpu-image-tag}}'
       command: [bash, -c]
@@ -869,18 +869,18 @@ spec:
       - |
         set -uo pipefail
         rc=0
-        # Pull this chunk's stores to node-local disk first. Reading them there is 0,49 s a
+        # Pull this batch's stores to node-local disk first. Reading them there is 0,49 s a
         # tile against 3,1 s straight from S3 (docs/21 8.16), which is worth having on a node
         # billed at GPU rates. Without --allow-missing a tile absent from the cube fails the
         # pod, which is what you want when the build pass is supposed to have finished.
         python scripts/argo/stage_cube.py \
-          --tiles-file "/work/chunks/chunk_{{inputs.parameters.chunk-id}}.csv" \
+          --tiles-file "/work/batches/batch_{{inputs.parameters.batch-id}}.csv" \
           --s3-cube "{{workflow.parameters.s3-cube}}" \
           --years "{{workflow.parameters.years}}" \
           --dest /scratch/cube || exit $?
 
         python scripts/73_map_inference.py \
-          --tiles-file "/work/chunks/chunk_{{inputs.parameters.chunk-id}}.csv" \
+          --tiles-file "/work/batches/batch_{{inputs.parameters.batch-id}}.csv" \
           --dest "{{workflow.parameters.s3-dest}}" \
           --mapbiomas-dir "{{workflow.parameters.s3-mapbiomas}}" \
           --ckpt-dir /work/assets/models/final \
@@ -895,9 +895,9 @@ spec:
           --load-threads 0 \
           --torch-threads 1 \
           --device cuda \
-          --tag "{{workflow.parameters.tag}}-infer-{{inputs.parameters.chunk-id}}" || rc=$?
+          --tag "{{workflow.parameters.tag}}-infer-{{inputs.parameters.batch-id}}" || rc=$?
         python scripts/argo/upload_run_evidence.py /work/out \
-          "{{workflow.parameters.s3-dest}}/_runs/{{workflow.name}}/chunk-{{inputs.parameters.chunk-id}}" \
+          "{{workflow.parameters.s3-dest}}/_runs/{{workflow.name}}/batch-{{inputs.parameters.batch-id}}" \
           || echo "WARNING: run evidence was not uploaded" >&2
         exit $rc
       env:
@@ -1021,12 +1021,12 @@ spec:
             # 3,1 s solo), staging costs 2,7 s of transfer plus 0,47 s to read back warm or
             # 2,50 s genuinely cold on a ~134 MB/s disk. So staging wins either way -- 2,6x warm,
             # 1,6x cold -- and NVMe buys the difference between those two. It also covers the
-            # case where a chunk outgrows the page cache, which at the default 18 tiles it does
+            # case where a batch outgrows the page cache, which at the default 18 tiles it does
             # not: ~6 GB staged against a 24Gi limit with ~8 GB of work. Every shape that
             # survives the two filters above
             # (g4dn, g5, g6, g6e) carries >=125 GB of it, so this narrows nothing in practice;
             # it excludes p3, which is EBS-only, and which the v100 filter already excluded.
-            # 100 GB leaves room for a CUDA image plus the staged chunk several times over.
+            # 100 GB leaves room for a CUDA image plus the staged batch several times over.
             #
             # CAVEAT: this guarantees the INSTANCE has NVMe, not that the emptyDir lands on it
             # -- that depends on the NodeClass wiring the instance store into the kubelet's
@@ -1079,7 +1079,7 @@ spec:
     - {name: git-data, emptyDir: {}}
     - {name: work, emptyDir: {}}
     # Node-local disk for the staged cube. 18 tiles x ~392 MB at 27 years is ~7 GB, so 32Gi is
-    # over four times what a default chunk needs while staying small enough not to push
+    # over four times what a default batch needs while staying small enough not to push
     # Karpenter onto a bigger instance for ephemeral storage alone. Raise it if tiles-per-pod
     # goes up a lot. This is disk, so it does not count against the memory above.
     #
@@ -1102,11 +1102,11 @@ spec:
     # is `medium: Memory` here (tmpfs, RAM-speed). It is left off by default because tmpfs
     # counts against the pod's memory limit, which silently couples this volume to
     # tiles-per-pod: ~7 GB at 18 tiles fits inside 24Gi alongside ~8 GB of processes, but a
-    # bigger chunk would OOM the pod rather than fill a disk.
+    # bigger batch would OOM the pod rather than fill a disk.
     - name: scratch
       emptyDir:
         # tiles-per-pod x ~392 MB is the staged cube: ~7 GB at the default 18 tiles, ~36 GB if
-        # a chunk ever carried 90. 64Gi covers both with room to spare and sits comfortably
+        # a batch ever carried 90. 64Gi covers both with room to spare and sits comfortably
         # inside the 225 GB of NVMe on a g4dn.2xlarge once the CUDA image (~10-20 GB) is
         # allowed for. Capacity is not the binding constraint here -- throughput is, which is
         # what the instance-local-nvme requirement above is for.

@@ -20,7 +20,7 @@ and needs a prefetch thread inside the tile loop; this is the version that requi
 to `scripts/73`. Run it before inference, not during.
 
 Usage:
-    python stage_cube.py --tiles-file chunk_0.csv \
+    python stage_cube.py --tiles-file batch_0.csv \
         --s3-cube s3://BUCKET/PREFIX/cube/chile_30m \
         --years 2000-2026 --dest /scratch/cube [--threads 16]
 

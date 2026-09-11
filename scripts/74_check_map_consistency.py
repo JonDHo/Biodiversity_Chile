@@ -7,7 +7,7 @@ datacube needed). Three checks, each printed with a pass/fail line:
 1. **Scaler round trip.** The pickled `PowerTransformer` was written by an older
    scikit-learn; ``inverse_transform(transform(y)) == y`` on the training targets shows
    the unpickled object still computes what it did when fitted (LCBD, with lambda about
-   -4200, is the sensitive channel).
+   -4.2, is the sensitive channel).
 2. **Same inputs.** For every training plot, the context row built by
    `mapinfer.context_frame` from the topography table equals the row `features.build_design`
    produced for training, and the model input built by `FacetEnsemble.model_inputs` (the
