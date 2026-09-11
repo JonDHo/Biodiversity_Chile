@@ -54,10 +54,12 @@
 # ---------------------------------------------------------------------
 # UNVERIFIED FROM OUTSIDE THE CLUSTER -- check these two before the first submit
 # ---------------------------------------------------------------------
-#  1. The GPU scheduling hints -- the LAST unverified thing here. The arch is pinned to amd64
-#     (verified: the image index holds only linux/amd64) and the standard NVIDIA taint is
-#     tolerated, but whether this cluster ALSO wants a GPU-specific node label cannot be read
-#     from a CPU pod. gpu-preflight is a one-minute, one-pod test of exactly this.
+#  1. GPU scheduling. Now written against the real pool -- dask-gpu-worker-node-pool -- so
+#     both its taints are tolerated, its node-purpose label is selected, V100 is excluded
+#     (Volta/sm_70, dropped by CUDA 13) and single-GPU instances are required. What remains
+#     unverified is only whether that pool actually admits a non-dask pod in practice, which
+#     gpu-preflight settles in one pod and one minute. NOTE it is a BORROWED pool: it is
+#     described as dedicated to dask workers, and this workflow is not one.
 #  2. cuda-tag is set to 13-2-1 and gpu-image-tag to develop.latest; both were confirmed to
 #     exist on 2026-09-11. Neither is something this file can re-check for itself, and
 #     develop.latest moves, so if GPU pods fail to pull that is the first thing to look at --
@@ -173,6 +175,17 @@ spec:
       value: '10800'
     - name: infer-deadline-seconds
       value: '7200'
+    # NOTE ON SPOT. dask-gpu-worker-node-pool is spot-only, with expireAfter 12h and a 10m
+    # termination grace period, so an inference pod can lose its node mid-chunk. Three things
+    # already absorb that, which is why it is acceptable rather than merely tolerated:
+    #   - scripts/73 --resume treats a tile-year as done once its GeoTIFF is in S3, so a
+    #     reclaimed pod loses at most the tile in flight, not the chunk;
+    #   - retryStrategy limit 2 on infer-chunk reschedules it;
+    #   - stage_cube.py skips stores already present, though a retry landing on a NEW node
+    #     re-stages from S3 (~49 s for 18 tiles), since the scratch emptyDir dies with the node.
+    # The 2h deadline sits inside the 12h node expiry, so expiry should never cut a chunk.
+    # karpenter.sh/do-not-disrupt on the pod blocks Karpenter's VOLUNTARY disruption
+    # (consolidation, drift, expiry); it cannot block a spot reclaim, which is involuntary.
   artifactGC:
     serviceAccountName: easi-workflows-team-sa-argo
     strategy: OnWorkflowDeletion
@@ -366,15 +379,51 @@ spec:
       resources:
         limits: {cpu: '1', memory: 4Gi, nvidia.com/gpu: 1}
         requests: {cpu: '1', memory: 4Gi, nvidia.com/gpu: 1}
-    # amd64 because the image has no arm64 variant (see gpu-image-tag). This is not
-    # belt-and-braces: a T4 exists in both flavours -- g4dn is amd64, g5g is Graviton with a
-    # T4G -- so without this, Karpenter picking a g5g on price gives a node whose GPU is
-    # perfectly good and whose image will not run on it.
+    # ---- scheduling onto dask-gpu-worker-node-pool -------------------------------------
+    # Reuses the existing Karpenter pool "dask-gpu-worker-node-pool" (spot, instance-category
+    # p/g, amd64). There is no dedicated pool for this job and that pool has ample limits
+    # (480 CPU / 60 GPU) and sits at 0 nodes, so it scales from zero on demand.
+    #
+    # The pool carries TWO taints and BOTH must be tolerated or nothing schedules at all:
+    #   nvidia.com/gpu=true:NoSchedule
+    #   k8s.dask.org/dedicated=worker:NoSchedule   <- easy to miss; it is the dask-only gate
+    # Tolerating the second means borrowing a pool described as "dedicated ... for dask worker
+    # Pods". That is fine mechanically -- a taint is only a gate -- but it is a borrowed pool,
+    # so if the team ever needs it to be genuinely dask-only, this is the workflow to move.
     nodeSelector:
+      # Targets that pool specifically rather than any GPU node that happens to exist.
+      k8s.dask.org/node-purpose: worker
+      # amd64 because the image index holds only linux/amd64 (see gpu-image-tag). The pool
+      # already requires amd64, so this is agreement rather than a new constraint.
       kubernetes.io/arch: amd64
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+          - matchExpressions:
+            # THE IMPORTANT ONE. The pool allows l40s, l4, a10g, t4 AND v100. A V100 is Volta,
+            # compute capability sm_70, which CUDA 13 dropped -- so a cheap spot V100 would
+            # pull the image fine, see the GPU fine, and then die at the first forward with
+            # "no kernel image is available for execution on the device". The other four are
+            # sm_75 (t4), sm_86 (a10g) and sm_89 (l4, l40s), all of which CUDA 13 keeps.
+            # This is what turns that failure from likely-on-spot into impossible.
+            - key: eks.amazonaws.com/instance-gpu-name
+              operator: NotIn
+              values: [v100]
+            # One GPU per node. The pool permits up to 4, and docs/21 8.15 measured the knee at
+            # 4-6 processes on a SINGLE card with ~1 vCPU each -- so a 4-GPU node would be
+            # about 4x over-provisioned and three cards would sit idle. Plenty of single-GPU
+            # shapes exist (g4dn, g5, g6), so this does not meaningfully narrow spot choice.
+            - key: eks.amazonaws.com/instance-gpu-count
+              operator: In
+              values: ['1']
     tolerations:
     - key: nvidia.com/gpu
       operator: Exists
+      effect: NoSchedule
+    - key: k8s.dask.org/dedicated
+      operator: Equal
+      value: worker
       effect: NoSchedule
     retryStrategy: {limit: 1, retryPolicy: OnError}
 
@@ -746,10 +795,18 @@ spec:
         value: EMPTY_DIR
       resources:
         # docs/21 8.15: the knee is 4-6 processes per T4, ~640 MiB of VRAM each, and each
-        # process wants ~1 vCPU for the residue -- so a small GPU with 4-8 vCPU is the shape
-        # that fits, not a large or multi-GPU node.
-        limits: {cpu: '7', memory: 30Gi, nvidia.com/gpu: 1}
-        requests: {cpu: '7', memory: 30Gi, nvidia.com/gpu: 1}
+        # process wants ~1 vCPU for the residue -- so a small GPU with 8 vCPU is the shape that
+        # fits (g4dn.2xlarge, g5.2xlarge), not a large or multi-GPU node.
+        #
+        # 16Gi, NOT the 30Gi the build pod asks for, and the difference is load-bearing: a
+        # g4dn.2xlarge has 32 GiB with ~30 GiB allocatable, so a 30Gi request would not fit and
+        # Karpenter would step up to a 4xlarge -- twice the node to run the same four
+        # processes, which is precisely the over-provisioning 8.15 warns against. 16Gi is ample
+        # from the cube: there is no COG load transient at all, the staged array is ~820 MB per
+        # process and the interpolation was cut to 294 MiB (docs/21 8.8), so four processes sit
+        # near ~8 GB. The staged cube itself lives on disk, not in RAM.
+        limits: {cpu: '7', memory: 16Gi, nvidia.com/gpu: 1}
+        requests: {cpu: '7', memory: 16Gi, nvidia.com/gpu: 1}
       volumeMounts:
       - {mountPath: /work, name: work}
       - {mountPath: /git, name: git-data}
@@ -785,11 +842,51 @@ spec:
     # above is the standard request and is usually enough with a device plugin installed; the
     # toleration below is the common NVIDIA taint. If the cluster labels GPU nodes instead, add
     # a nodeSelector here. Confirm before the first submit -- see the header.
+    # ---- scheduling onto dask-gpu-worker-node-pool -------------------------------------
+    # Reuses the existing Karpenter pool "dask-gpu-worker-node-pool" (spot, instance-category
+    # p/g, amd64). There is no dedicated pool for this job and that pool has ample limits
+    # (480 CPU / 60 GPU) and sits at 0 nodes, so it scales from zero on demand.
+    #
+    # The pool carries TWO taints and BOTH must be tolerated or nothing schedules at all:
+    #   nvidia.com/gpu=true:NoSchedule
+    #   k8s.dask.org/dedicated=worker:NoSchedule   <- easy to miss; it is the dask-only gate
+    # Tolerating the second means borrowing a pool described as "dedicated ... for dask worker
+    # Pods". That is fine mechanically -- a taint is only a gate -- but it is a borrowed pool,
+    # so if the team ever needs it to be genuinely dask-only, this is the workflow to move.
     nodeSelector:
+      # Targets that pool specifically rather than any GPU node that happens to exist.
+      k8s.dask.org/node-purpose: worker
+      # amd64 because the image index holds only linux/amd64 (see gpu-image-tag). The pool
+      # already requires amd64, so this is agreement rather than a new constraint.
       kubernetes.io/arch: amd64
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+          - matchExpressions:
+            # THE IMPORTANT ONE. The pool allows l40s, l4, a10g, t4 AND v100. A V100 is Volta,
+            # compute capability sm_70, which CUDA 13 dropped -- so a cheap spot V100 would
+            # pull the image fine, see the GPU fine, and then die at the first forward with
+            # "no kernel image is available for execution on the device". The other four are
+            # sm_75 (t4), sm_86 (a10g) and sm_89 (l4, l40s), all of which CUDA 13 keeps.
+            # This is what turns that failure from likely-on-spot into impossible.
+            - key: eks.amazonaws.com/instance-gpu-name
+              operator: NotIn
+              values: [v100]
+            # One GPU per node. The pool permits up to 4, and docs/21 8.15 measured the knee at
+            # 4-6 processes on a SINGLE card with ~1 vCPU each -- so a 4-GPU node would be
+            # about 4x over-provisioned and three cards would sit idle. Plenty of single-GPU
+            # shapes exist (g4dn, g5, g6), so this does not meaningfully narrow spot choice.
+            - key: eks.amazonaws.com/instance-gpu-count
+              operator: In
+              values: ['1']
     tolerations:
     - key: nvidia.com/gpu
       operator: Exists
+      effect: NoSchedule
+    - key: k8s.dask.org/dedicated
+      operator: Equal
+      value: worker
       effect: NoSchedule
     outputs:
       artifacts:
@@ -800,11 +897,13 @@ spec:
     volumes:
     - {name: git-data, emptyDir: {}}
     - {name: work, emptyDir: {}}
-    # Node-local disk for the staged cube. 18 tiles x ~392 MB at 27 years is ~7 GB; the limit
-    # is set well above that so a larger chunk does not evict the pod.
+    # Node-local disk for the staged cube. 18 tiles x ~392 MB at 27 years is ~7 GB, so 32Gi is
+    # over four times what a default chunk needs while staying small enough not to push
+    # Karpenter onto a bigger instance for ephemeral storage alone. Raise it if tiles-per-pod
+    # goes up a lot. This is disk, so it does not count against the 16Gi of memory above.
     - name: scratch
       emptyDir:
-        sizeLimit: 64Gi
+        sizeLimit: 32Gi
     - name: db-config
       secret:
         secretName: '{{workflow.parameters.db-config-secret}}'
