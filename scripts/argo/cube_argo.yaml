@@ -147,6 +147,13 @@ spec:
   # ---------------- DAGs ----------------
   - name: main
     dag:
+      # If gpu-preflight fails, let the build stage run to completion anyway. The build is the
+      # expensive half (~360 s a tile) and it is fully resumable, so throwing away partly-built
+      # capacity to report a GPU problem sooner would be a poor trade -- the report is already
+      # immediate, since the preflight runs alongside the build rather than after it. Fix the
+      # image and submit --entrypoint infer-only against the cube that got built.
+      # It also means one bad build chunk does not cancel the other four, which are independent.
+      failFast: false
       tasks:
       - name: check-access
         template: check-access
@@ -154,6 +161,9 @@ spec:
           parameters:
           - name: require-gpu
             value: 'true'
+      - name: gpu-preflight
+        template: gpu-preflight
+        depends: check-access
       - name: list-to-build
         template: list-to-build
         depends: check-access
@@ -181,7 +191,7 @@ spec:
       # own deadlines, parallelism and retries.
       - name: list-missing-maps
         template: list-missing-maps
-        depends: build-chunk
+        depends: build-chunk && gpu-preflight
       - name: split-infer
         template: split-tiles
         depends: list-missing-maps
@@ -241,9 +251,12 @@ spec:
           parameters:
           - name: require-gpu
             value: 'true'
+      - name: gpu-preflight
+        template: gpu-preflight
+        depends: check-access
       - name: list-missing-maps
         template: list-missing-maps
-        depends: check-access
+        depends: gpu-preflight
       - name: split-infer
         template: split-tiles
         depends: list-missing-maps
@@ -264,6 +277,50 @@ spec:
             value: '{{item}}'
 
   # ---------------- steps ----------------
+  # Proves, in about a minute and on one short-lived pod, the three things about the GPU side
+  # that nothing else here can check: that the image name resolves and pulls, that the
+  # scheduling hints actually get this workflow a GPU, and that the torch in that image can
+  # run on the card it lands on. Under `main` the GPU pods are otherwise the LAST thing to
+  # run, so without this any of the three would surface with the whole cube already built.
+  #
+  # The arch check is the non-obvious one. `cuda-tag` moves over time and newer CUDA releases
+  # drop older GPU architectures, so an image can pull cleanly, see the card, and still have
+  # no kernels for it -- torch then fails at the first forward with "no kernel image is
+  # available for execution on the device", which is a confusing error to meet at hour six.
+  # A T4 is compute capability 7.5; get_arch_list() is what says whether this build has it.
+  - name: gpu-preflight
+    activeDeadlineSeconds: '900'
+    container:
+      image: '{{workflow.parameters.gpu-registry}}/easi-workflows-base-nvidia-{{workflow.parameters.cuda-tag}}-torch-cudnn-runtime:{{workflow.parameters.gpu-image-tag}}'
+      command: [python, -c]
+      args:
+      - |
+        import sys, torch
+        print("torch", torch.__version__, "built for CUDA", torch.version.cuda, flush=True)
+        if not torch.cuda.is_available():
+            sys.exit("no CUDA device visible: the pod did not get a GPU, or the image "
+                     "cannot see it. Check the toleration/nodeSelector on infer-chunk.")
+        name = torch.cuda.get_device_name(0)
+        cap = torch.cuda.get_device_capability(0)
+        archs = torch.cuda.get_arch_list()
+        print(f"device: {name}  capability sm_{cap[0]}{cap[1]}", flush=True)
+        print(f"kernels built for: {archs}", flush=True)
+        if f"sm_{cap[0]}{cap[1]}" not in archs:
+            sys.exit(f"this torch has no kernels for sm_{cap[0]}{cap[1]} ({name}). Pick an "
+                     f"older cuda-tag, or a GPU this build supports.")
+        # Actually run something, because is_available() alone has never proven a kernel runs.
+        a = torch.randn(256, 256, device="cuda")
+        print("matmul ok:", float((a @ a).sum()) == float((a @ a).sum()), flush=True)
+        print("GPU PREFLIGHT OK", flush=True)
+      resources:
+        limits: {cpu: '1', memory: 4Gi, nvidia.com/gpu: 1}
+        requests: {cpu: '1', memory: 4Gi, nvidia.com/gpu: 1}
+    tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+    retryStrategy: {limit: 1, retryPolicy: OnError}
+
   - name: check-access
     inputs:
       parameters:
