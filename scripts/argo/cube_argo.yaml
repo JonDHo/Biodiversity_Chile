@@ -92,18 +92,10 @@ metadata:
 spec:
   arguments:
     parameters:
-    # Only build-batch needs this one. `import biodiv.maptask` pulls torch in through
-    # mapinfer -- verified, not assumed -- so the build pod cannot use the base image even
-    # though the build itself never runs a model. Making mapinfer's torch import lazy would
-    # free it, which is worth considering if spot churn makes pod startup matter: the build
-    # pass is meant for the cheapest capacity going, and that is the capacity that restarts.
-    - name: torch-cpu-image
-      value: 444488357543.dkr.ecr.us-west-2.amazonaws.com/easi-workflows-base-torch-cpu:develop.latest
-    # The list and split steps need boto3 and the standard library, nothing else: they read
-    # and write CSVs and call S3. cube_progress.py deliberately does not import `biodiv` at
-    # all (it repeats the store-name convention instead), which is what lets them run here.
-    # UNVERIFIED name, but cheap to get wrong -- these steps fail within seconds of the
-    # submit, unlike the GPU image, which is why that one gets a preflight and this does not.
+    # Every CPU step, build-batch included. The build imports biodiv.maptask, which reaches
+    # mapinfer, but mapinfer only imports torch inside FacetEnsemble, so no CPU pod needs the
+    # torch image. Checked against develop.latest on 2026-09-12: datacube 1.9.22, zarr 3.3.0,
+    # rasterio, pyproj, s3fs, sklearn 1.9.1 present; torch absent.
     - name: base-image
       value: 444488357543.dkr.ecr.us-west-2.amazonaws.com/easi-workflows-base:develop.latest
     # The GPU image is composed from cuda-tag rather than written out, because the CUDA
@@ -300,7 +292,7 @@ spec:
   # One running infer-batch pod is one single-GPU spot node, so this parallelism is the
   # GPU node count.
   - name: infer-stage
-    parallelism: 5
+    parallelism: 4
     inputs:
       artifacts:
       - name: missing-csv
@@ -693,6 +685,7 @@ spec:
         python /git/repo/scripts/argo/tile_progress.py \
           --tiles-csv "/work/assets/tiles/{{workflow.parameters.tiles-csv-name}}" \
           --s3-dest "{{workflow.parameters.s3-dest}}" \
+          --s3-cube "{{workflow.parameters.s3-cube}}" \
           --years "{{workflow.parameters.years}}" \
           --limit "{{workflow.parameters.limit-tiles}}" \
           --out /work/missing_tiles.csv
@@ -762,6 +755,8 @@ spec:
         n = int(os.environ["NUM_BATCHES"])
         os.makedirs("/work/batches", exist_ok=True)
         size = math.ceil(len(rows) / n) if rows else 0
+        print(f"{len(rows)} tiles to process, {n} batches requested, "
+              f"up to {size} tiles per batch", flush=True)
         ids = []
         for i in range(n):
             part = rows[i * size:(i + 1) * size] if size else []
@@ -772,7 +767,13 @@ spec:
                 w = csv.writer(f)
                 w.writerow(header)
                 w.writerows(part)
+            print(f"  batch {i}: {len(part)} tiles  {part[0][0]} .. {part[-1][0]}", flush=True)
+        if len(ids) < n:
+            print(f"{n - len(ids)} requested batches are empty and will not run", flush=True)
+        summary = f"{len(rows)} tiles in {len(ids)} batches"
+        print(summary, flush=True)
         json.dump(ids, open("/work/batch_ids.json", "w"))
+        open("/work/summary.txt", "w").write(summary)
       env:
       - name: NUM_BATCHES
         value: '{{inputs.parameters.num-batches}}'
@@ -788,6 +789,8 @@ spec:
       parameters:
       - name: batch-ids
         valueFrom: {path: /work/batch_ids.json}
+      - name: summary
+        valueFrom: {path: /work/summary.txt}
     volumes:
     - {name: work, emptyDir: {}}
     archiveLocation:
@@ -806,7 +809,7 @@ spec:
       parameters:
       - name: batch-id
     container:
-      image: '{{workflow.parameters.torch-cpu-image}}'
+      image: '{{workflow.parameters.base-image}}'
       command: [bash, -c]
       workingDir: /git/repo
       args:

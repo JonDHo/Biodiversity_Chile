@@ -42,13 +42,11 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import torch
 import xarray as xr
 
 from . import targets as tg
 from .curves import ROLL, interp_grid
 from .features import STRATA, TOPO_VARS, Preprocessor
-from .models_conv import build_model
 from .transforms1d import make_transform
 
 NGS = 100
@@ -313,7 +311,7 @@ def context_frame(columns: list[str], topo: dict[str, np.ndarray], area_m2: floa
 @dataclass
 class Member:
     path: Path
-    model: torch.nn.Module
+    model: object                      # torch.nn.Module
     pre: Preprocessor
     scaler: object
     targets: list[str]
@@ -345,6 +343,9 @@ class FacetEnsemble:
         from disk (`biodiv.maptask`). Same tensors either way -- ``torch.load`` does not care
         -- and the member keeps a synthetic name so error messages still say which seed.
         """
+        import torch
+        from .models_conv import build_model
+
         self.device = torch.device(device)
         self.members: list[Member] = []
         for i, p in enumerate(ckpt_paths):
@@ -403,7 +404,6 @@ class FacetEnsemble:
             return curve1d_inputs(curves)
         return images_from_curves(curves, self._perm)
 
-    @torch.no_grad()
     def predict_scaled(self, images: np.ndarray, ctx: pd.DataFrame,
                        batch: int = 8192) -> np.ndarray:
         """(n_members, N, n_targets) in the transformed target space.
@@ -412,6 +412,8 @@ class FacetEnsemble:
         ensemble, ``(N, 1, side, side)`` for a 2D-CNN one -- so the finite-check collapses
         every axis but the first rather than assuming a fixed number of dimensions.
         """
+        import torch
+
         out = np.full((len(self.members), images.shape[0], len(self.targets)), np.nan,
                       np.float32)
         ok = np.isfinite(images).reshape(images.shape[0], -1).all(axis=1)
@@ -419,14 +421,15 @@ class FacetEnsemble:
         if idx.size == 0:
             return out
         x_all = torch.from_numpy(images[idx])
-        for k, m in enumerate(self.members):
-            c_all = torch.from_numpy(m.pre.transform(ctx.iloc[idx]))
-            preds = []
-            for s in range(0, len(idx), batch):
-                xb = x_all[s:s + batch].to(self.device)
-                cb = c_all[s:s + batch].to(self.device)
-                preds.append(m.model(xb, cb).cpu().numpy())
-            out[k, idx] = np.concatenate(preds, axis=0)
+        with torch.no_grad():
+            for k, m in enumerate(self.members):
+                c_all = torch.from_numpy(m.pre.transform(ctx.iloc[idx]))
+                preds = []
+                for s in range(0, len(idx), batch):
+                    xb = x_all[s:s + batch].to(self.device)
+                    cb = c_all[s:s + batch].to(self.device)
+                    preds.append(m.model(xb, cb).cpu().numpy())
+                out[k, idx] = np.concatenate(preds, axis=0)
         return out
 
     def scaled_bounds(self, y_train: np.ndarray, member: int = 0) -> tuple[np.ndarray, np.ndarray]:

@@ -68,6 +68,23 @@ def is_complete(s3, bucket: str, prefix: str, name: str) -> bool:
         return False
 
 
+def built_tiles(s3, s3_cube: str, tile_ids: list[str], resolution: int, y0: int, y1: int,
+                threads: int = 32) -> tuple[set[str], int]:
+    """Tile ids whose store under ``s3_cube`` is complete, and how many stores exist but
+    lack the completion marker."""
+    u = urlparse(s3_cube)
+    bucket, prefix = u.netloc, u.path.lstrip("/")
+    if not prefix.endswith("/"):
+        prefix += "/"
+    candidates = list_candidates(s3, bucket, prefix)
+    wanted = {t: store_name(t, resolution, y0, y1) for t in tile_ids}
+    check = [n for n in wanted.values() if n in candidates]
+    with ThreadPoolExecutor(max_workers=max(1, threads)) as ex:
+        complete = {n for n, ok in zip(check, ex.map(
+            lambda n: is_complete(s3, bucket, prefix, n), check)) if ok}
+    return {t for t, n in wanted.items() if n in complete}, len(check) - len(complete)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -82,26 +99,14 @@ def main() -> None:
     args = p.parse_args()
 
     y0, y1 = (int(v) for v in args.years.split("-"))
-    u = urlparse(args.s3_cube)
-    bucket, prefix = u.netloc, u.path.lstrip("/")
-    if not prefix.endswith("/"):
-        prefix += "/"
-
     s3 = boto3.client("s3")
-    candidates = list_candidates(s3, bucket, prefix)
-
     with open(args.tiles_csv) as f:
         rows = list(csv.DictReader(f))
 
-    wanted = {r["tile_id"]: store_name(r["tile_id"], args.resolution, y0, y1) for r in rows}
-    check = [n for n in wanted.values() if n in candidates]
-    with ThreadPoolExecutor(max_workers=max(1, args.threads)) as ex:
-        complete = {n for n, ok in zip(check, ex.map(
-            lambda n: is_complete(s3, bucket, prefix, n), check)) if ok}
-
-    missing = [r for r in rows if wanted[r["tile_id"]] not in complete]
+    built, torn = built_tiles(s3, args.s3_cube, [r["tile_id"] for r in rows],
+                              args.resolution, y0, y1, args.threads)
+    missing = [r for r in rows if r["tile_id"] not in built]
     n_done = len(rows) - len(missing)
-    torn = len(check) - len(complete)
     print(f"cube: {n_done}/{len(rows)} tiles built "
           f"({100 * n_done / len(rows):.2f}%), {len(missing)} to build"
           + (f"; {torn} store(s) present but incomplete, they will be rebuilt" if torn else ""),
