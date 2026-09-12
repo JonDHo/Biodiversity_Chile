@@ -25,9 +25,9 @@ without an "ok" row behind it.
 
 Usage:
     python argo/verify_run.py \
-        --s3-dest s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/maps/chile_30m_2000_2026 \
+        --s3-dest s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/outputs/maps/chile_30m_2000_2026 \
         --years 2020-2020 --tiles t123_456 \
-        --manifest s3://.../_runs/<workflow>/chunk-0/argo-test1-0/manifest.csv
+        --manifest s3://.../work/runs/<workflow>/infer/chunk-0/argo-test1-0/manifest.csv
 
 Exit status is 0 only when every check passed.
 """

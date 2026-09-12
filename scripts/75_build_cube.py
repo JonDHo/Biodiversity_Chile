@@ -7,7 +7,7 @@ store, so that every later inference run reads the cube instead (`docs/21` 8.14,
 
     python scripts/75_build_cube.py \
         --tiles-file missing_tiles.csv --years 2000-2026 \
-        --cube s3://BUCKET/PREFIX/cube/chile_30m --workers 7 --resume
+        --cube s3://BUCKET/PREFIX/work/cube/chile_30m --workers 7 --resume
 
 **The scheduler is the one decision that matters here, and it is not the one `scripts/73`
 makes.** `scripts/73` loads with a threaded scheduler because a `LocalCluster`'s workers stay

@@ -21,7 +21,7 @@ to `scripts/73`. Run it before inference, not during.
 
 Usage:
     python stage_cube.py --tiles-file batch_0.csv \
-        --s3-cube s3://BUCKET/PREFIX/cube/chile_30m \
+        --s3-cube s3://BUCKET/PREFIX/work/cube/chile_30m \
         --years 2000-2026 --dest /scratch/cube [--threads 16]
 
 Skips stores already present and complete, so a retried pod does not re-download what the

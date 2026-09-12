@@ -1,7 +1,7 @@
 # biodiv-cube -- build the materialised kNDVI cube, then infer from it.
 #
 #   argo submit -n easi-workflows-argo scripts/argo/cube_argo.yaml \
-#     -p limit-tiles=90 -p num-batches=5
+#     -p limit-tiles=90 -p build-num-batches=5 -p infer-num-batches=5
 #
 # This is `docs/24` Option A: one construction pass on cheap CPU, then all inference against
 # the cube on a small GPU node. It is SEPARATE from process_argo.yaml, which stays as the
@@ -77,8 +77,8 @@
 #     develop.latest moves, so if GPU pods fail to pull that is the first thing to look at --
 #     and note the CUDA version is hyphenated, since it is part of the repository name.
 #  (S3 is NOT a question: the easi-workflows-team service account carries access to every
-#   prefix below easi-workflows-team/, so the new cube/ prefix is covered like the rest.
-#   check-access still writes a preflight object to it, which costs nothing and localises a
+#   prefix below easi-workflows-team/, so work/ and outputs/ are covered like the rest.
+#   check-access still writes a preflight object, which costs nothing and localises a
 #   credential problem to the first second of the run.)
 apiVersion: argoproj.io/v1alpha1
 kind: Workflow
@@ -152,17 +152,23 @@ spec:
     - name: aws-image
       value: amazon/aws-cli:2.17.62
     - name: repo-url
-      value: https://github.com/JavierLopatin/Biodiversity_Chile.git
+      value: https://github.com/JonDHo/Biodiversity_Chile.git
     - name: repo-branch
-      value: main
+      value: perf-dev
     - name: git-image
       value: registry.k8s.io/git-sync/git-sync:v4.5.0
     - name: db-config-secret
       value: easi-odc-v2-user-db
+    # Layout under biodiv/: outputs/ holds finished products and nothing else; work/ holds
+    # everything a run needs or leaves behind -- the zarr cube cache (kept for --resume), and
+    # runs/<workflow>/ with the preflight marker, per-batch manifests and archived pod logs.
+    # work/ can be deleted wholesale to start from nothing.
+    - name: s3-work
+      value: s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/work
     - name: s3-cube
-      value: s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/cube/chile_30m
+      value: s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/work/cube/chile_30m
     - name: s3-dest
-      value: s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/maps/chile_30m_2000_2026
+      value: s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/outputs/maps/chile_30m_2000_2026
     - name: s3-assets
       value: s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/assets
     - name: s3-mapbiomas
@@ -177,8 +183,17 @@ spec:
       value: cube-run1
     - name: limit-tiles
       value: '90'
-    - name: num-batches
-      value: '15'
+    # Each stage has its own batch count and its own concurrency cap. The caps are the
+    # `parallelism` fields on build-stage and infer-stage below, under the workflow-level one
+    # -- Argo does not template that field, so they are edited in place rather than passed
+    # with -p. Batch count then only
+    # sets granularity: how much work one pod holds, and so how much a spot loss or a
+    # deadline can cost. One infer pod is one single-GPU node, so infer-stage parallelism IS
+    # the number of GPU nodes.
+    - name: build-num-batches
+      value: '30'
+    - name: infer-num-batches
+      value: '10'
     - name: build-workers
       value: '7'
     - name: infer-jobs
@@ -202,7 +217,10 @@ spec:
     serviceAccountName: easi-workflows-team-sa-argo
     strategy: OnWorkflowDeletion
   entrypoint: main
-  parallelism: 5
+  # The controller injects parallelism 3 when this is absent, and the workflow-level cap counts
+  # every running pod across all templates, so it must be at least the larger of the two
+  # stage caps below or it silently throttles them.
+  parallelism: 30
   podGC:
     strategy: OnWorkflowSuccess
   serviceAccountName: easi-workflows-team-sa-argo
@@ -211,13 +229,9 @@ spec:
   # ---------------- DAGs ----------------
   - name: main
     dag:
-      # One bad build batch does not cancel the others, which are independent; the build is
-      # fully resumable, so a partial pass is worth keeping.
-      #
       # No GPU preflight in the run itself: the node it would test is released before
       # infer-batch provisions its own, and the scheduling constraints on infer-batch are what
       # guarantee the shape. The standalone smoke test is `--entrypoint gpu-check`.
-      failFast: false
       tasks:
       - name: check-access
         template: check-access
@@ -228,13 +242,49 @@ spec:
       - name: list-to-build
         template: list-to-build
         depends: check-access
-      - name: split-build
-        template: split-tiles
+      - name: build-stage
+        template: build-stage
         depends: list-to-build
         arguments:
           artifacts:
           - name: missing-csv
             from: '{{tasks.list-to-build.outputs.artifacts.missing-csv}}'
+      # THE BARRIER. This one `depends` is what makes the run biphasic; every build-batch pod
+      # must finish before any inference starts. Removing it is not the way to overlap -- use
+      # --entrypoint infer-only in a second submission instead, so the two stages keep their
+      # own deadlines, parallelism and retries.
+      - name: list-missing-maps
+        template: list-missing-maps
+        depends: build-stage
+      - name: infer-stage
+        template: infer-stage
+        depends: list-missing-maps
+        arguments:
+          artifacts:
+          - name: missing-csv
+            from: '{{tasks.list-missing-maps.outputs.artifacts.missing-csv}}'
+
+  # Split then fan out, one stage per template so each carries its own concurrency cap.
+  # `parallelism` here counts this template's running children, i.e. batch pods.
+  - name: build-stage
+    parallelism: 30
+    inputs:
+      artifacts:
+      - name: missing-csv
+    dag:
+      # One bad build batch does not cancel the others, which are independent; the build is
+      # fully resumable, so a partial pass is worth keeping.
+      failFast: false
+      tasks:
+      - name: split-build
+        template: split-tiles
+        arguments:
+          parameters:
+          - name: num-batches
+            value: '{{workflow.parameters.build-num-batches}}'
+          artifacts:
+          - name: missing-csv
+            from: '{{inputs.artifacts.missing-csv}}'
       - name: build-batch
         template: build-batch
         depends: split-build
@@ -246,20 +296,26 @@ spec:
           parameters:
           - name: batch-id
             value: '{{item}}'
-      # THE BARRIER. This one `depends` is what makes the run biphasic; every build-batch pod
-      # must finish before any inference starts. Removing it is not the way to overlap -- use
-      # --entrypoint infer-only in a second submission instead, so the two stages keep their
-      # own deadlines, parallelism and retries.
-      - name: list-missing-maps
-        template: list-missing-maps
-        depends: build-batch
+
+  # One running infer-batch pod is one single-GPU spot node, so this parallelism is the
+  # GPU node count.
+  - name: infer-stage
+    parallelism: 5
+    inputs:
+      artifacts:
+      - name: missing-csv
+    dag:
+      failFast: false
+      tasks:
       - name: split-infer
         template: split-tiles
-        depends: list-missing-maps
         arguments:
+          parameters:
+          - name: num-batches
+            value: '{{workflow.parameters.infer-num-batches}}'
           artifacts:
           - name: missing-csv
-            from: '{{tasks.list-missing-maps.outputs.artifacts.missing-csv}}'
+            from: '{{inputs.artifacts.missing-csv}}'
       - name: infer-batch
         template: infer-batch
         depends: split-infer
@@ -305,24 +361,13 @@ spec:
       - name: list-to-build
         template: list-to-build
         depends: check-access
-      - name: split-build
-        template: split-tiles
+      - name: build-stage
+        template: build-stage
         depends: list-to-build
         arguments:
           artifacts:
           - name: missing-csv
             from: '{{tasks.list-to-build.outputs.artifacts.missing-csv}}'
-      - name: build-batch
-        template: build-batch
-        depends: split-build
-        withParam: '{{tasks.split-build.outputs.parameters.batch-ids}}'
-        arguments:
-          artifacts:
-          - name: batches
-            from: '{{tasks.split-build.outputs.artifacts.batches}}'
-          parameters:
-          - name: batch-id
-            value: '{{item}}'
 
   - name: infer-only
     dag:
@@ -336,24 +381,13 @@ spec:
       - name: list-missing-maps
         template: list-missing-maps
         depends: check-access
-      - name: split-infer
-        template: split-tiles
+      - name: infer-stage
+        template: infer-stage
         depends: list-missing-maps
         arguments:
           artifacts:
           - name: missing-csv
             from: '{{tasks.list-missing-maps.outputs.artifacts.missing-csv}}'
-      - name: infer-batch
-        template: infer-batch
-        depends: split-infer
-        withParam: '{{tasks.split-infer.outputs.parameters.batch-ids}}'
-        arguments:
-          artifacts:
-          - name: batches
-            from: '{{tasks.split-infer.outputs.artifacts.batches}}'
-          parameters:
-          - name: batch-id
-            value: '{{item}}'
 
   # ---------------- steps ----------------
   # Proves, in about a minute and on one short-lived pod, the three things about the GPU side
@@ -573,9 +607,13 @@ spec:
       source: |
         set -eux
         echo "biodiv-cube {{workflow.name}}" > /tmp/preflight.txt
-        # The cube prefix is new, so it is the one this must actually prove writable.
-        aws s3 cp /tmp/preflight.txt "{{workflow.parameters.s3-cube}}/_preflight/{{workflow.name}}.txt"
-        aws s3 cp /tmp/preflight.txt "{{workflow.parameters.s3-dest}}/_preflight/{{workflow.name}}.txt"
+        aws s3 cp /tmp/preflight.txt "{{workflow.parameters.s3-work}}/runs/{{workflow.name}}/preflight.txt"
+        # s3-cube and s3-dest can be pointed outside s3-work with -p, so prove them writable
+        # too; the marker is removed so neither prefix holds anything but its data.
+        for p in "{{workflow.parameters.s3-cube}}" "{{workflow.parameters.s3-dest}}"; do
+          aws s3 cp /tmp/preflight.txt "$p/.preflight-{{workflow.name}}"
+          aws s3 rm "$p/.preflight-{{workflow.name}}"
+        done
         aws s3 ls "{{workflow.parameters.s3-assets}}/tiles/{{workflow.parameters.tiles-csv-name}}"
         # Fail in the first second rather than after the build stage. Under `main` the GPU
         # pods are the LAST thing to run, so an empty CUDA tag would otherwise surface hours
@@ -638,12 +676,13 @@ spec:
     volumes:
     - {name: git-data, emptyDir: {}}
     - {name: work, emptyDir: {}}
+    # `key` is bucket-relative and cannot take a parameter, so it repeats s3-work by hand.
     archiveLocation:
       archiveLogs: true
       s3:
         bucket: easido-prod-dc-data-projects
         endpoint: s3.amazonaws.com
-        key: easi-workflows-team/biodiv/argo-artifacts/{{workflow.name}}/{{pod.name}}
+        key: easi-workflows-team/biodiv/work/runs/{{workflow.name}}/logs/{{pod.name}}
 
   - name: list-missing-maps
     container:
@@ -701,11 +740,13 @@ spec:
       s3:
         bucket: easido-prod-dc-data-projects
         endpoint: s3.amazonaws.com
-        key: easi-workflows-team/biodiv/argo-artifacts/{{workflow.name}}/{{pod.name}}
+        key: easi-workflows-team/biodiv/work/runs/{{workflow.name}}/logs/{{pod.name}}
 
   # Shared by both stages: same input columns, same output shape.
   - name: split-tiles
     inputs:
+      parameters:
+      - name: num-batches
       artifacts:
       - name: missing-csv
         path: /work/missing_tiles.csv
@@ -734,7 +775,7 @@ spec:
         json.dump(ids, open("/work/batch_ids.json", "w"))
       env:
       - name: NUM_BATCHES
-        value: '{{workflow.parameters.num-batches}}'
+        value: '{{inputs.parameters.num-batches}}'
       resources:
         limits: {cpu: 500m, memory: 512Mi}
         requests: {cpu: 500m, memory: 512Mi}
@@ -754,7 +795,7 @@ spec:
       s3:
         bucket: easido-prod-dc-data-projects
         endpoint: s3.amazonaws.com
-        key: easi-workflows-team/biodiv/argo-artifacts/{{workflow.name}}/{{pod.name}}
+        key: easi-workflows-team/biodiv/work/runs/{{workflow.name}}/logs/{{pod.name}}
 
   - name: build-batch
     activeDeadlineSeconds: '{{workflow.parameters.build-deadline-seconds}}'
@@ -784,7 +825,7 @@ spec:
         # copy it dies with the pod and the stores in S3 have no provenance. Uploaded whether
         # or not the pass succeeded -- a failed batch is exactly when it is worth having.
         python scripts/argo/upload_run_evidence.py /work/out \
-          "{{workflow.parameters.s3-cube}}/_runs/{{workflow.name}}/batch-{{inputs.parameters.batch-id}}" \
+          "{{workflow.parameters.s3-work}}/runs/{{workflow.name}}/build/batch-{{inputs.parameters.batch-id}}" \
           || echo "WARNING: run evidence was not uploaded" >&2
         exit $rc
       env:
@@ -851,7 +892,7 @@ spec:
       s3:
         bucket: easido-prod-dc-data-projects
         endpoint: s3.amazonaws.com
-        key: easi-workflows-team/biodiv/argo-artifacts/{{workflow.name}}/{{pod.name}}
+        key: easi-workflows-team/biodiv/work/runs/{{workflow.name}}/logs/{{pod.name}}
 
   - name: infer-batch
     activeDeadlineSeconds: '{{workflow.parameters.infer-deadline-seconds}}'
@@ -897,7 +938,7 @@ spec:
           --device cuda \
           --tag "{{workflow.parameters.tag}}-infer-{{inputs.parameters.batch-id}}" || rc=$?
         python scripts/argo/upload_run_evidence.py /work/out \
-          "{{workflow.parameters.s3-dest}}/_runs/{{workflow.name}}/batch-{{inputs.parameters.batch-id}}" \
+          "{{workflow.parameters.s3-work}}/runs/{{workflow.name}}/infer/batch-{{inputs.parameters.batch-id}}" \
           || echo "WARNING: run evidence was not uploaded" >&2
         exit $rc
       env:
@@ -1121,9 +1162,9 @@ spec:
       s3:
         bucket: easido-prod-dc-data-projects
         endpoint: s3.amazonaws.com
-        key: easi-workflows-team/biodiv/argo-artifacts/{{workflow.name}}/{{pod.name}}
+        key: easi-workflows-team/biodiv/work/runs/{{workflow.name}}/logs/{{pod.name}}
   # artifactGC is OnWorkflowDeletion, so this is also the window in which
-  # `argo cp ... --artifact-name run-evidence` still works. The S3 copies under _runs/ survive
+  # `argo cp ... --artifact-name run-evidence` still works. The S3 copies under work/runs/ survive
   # either way; this only governs the Argo-side copy.
   ttlStrategy:
     secondsAfterSuccess: 86400

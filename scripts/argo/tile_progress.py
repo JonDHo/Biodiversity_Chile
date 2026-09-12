@@ -12,7 +12,7 @@ reprocessing a tile someone else already finished.
 Usage:
     python tile_progress.py \
         --tiles-csv tiles_native_10km.csv \
-        --s3-dest s3://easido-prod-user-scratch/<userid>/biodiv/maps/chile_30m_2000_2026 \
+        --s3-dest s3://easido-prod-user-scratch/<userid>/biodiv/outputs/maps/chile_30m_2000_2026 \
         --years 2000-2026 \
         [--limit N] [--out missing_tiles.csv]
 

@@ -247,7 +247,7 @@ python scripts/73_map_inference.py \
     --tiles-file results/figures/tiles_native_10km_run.csv --years 2000-2026 \
     --area-m2 900 --stratum basal --mask mapbiomas \
     --gw-workers 128 --worker-cores 2 --worker-memory 8 --worker-threads 1 \
-    --load-threads 4 --dest s3://<scratch>/biodiv/maps/chile_30m_2000_2026 \
+    --load-threads 4 --dest s3://<scratch>/biodiv/outputs/maps/chile_30m_2000_2026 \
     --mapbiomas-dir s3://<scratch>/biodiv/MapBiomas \
     --out results/maps --tag chile_full_30m --resume
 ```

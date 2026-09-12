@@ -18,7 +18,7 @@ tile).
 Usage:
     python cube_progress.py \
         --tiles-csv tiles_native_10km.csv \
-        --s3-cube s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/cube/chile_30m \
+        --s3-cube s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/work/cube/chile_30m \
         --years 2000-2026 \
         [--limit N] [--out missing_tiles.csv] [--threads 32]
 

@@ -98,7 +98,7 @@
 # script gives a live progress check by hand:
 #
 #   python scripts/argo/tile_progress.py --tiles-csv results/figures/tiles_native_10km.csv \
-#     --s3-dest s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/maps/chile_30m_2000_2026 \
+#     --s3-dest s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/outputs/maps/chile_30m_2000_2026 \
 #     --years 2000-2026
 #
 # ---------------------------------------------------------------------
@@ -140,8 +140,10 @@ spec:
       value: registry.k8s.io/git-sync/git-sync:v4.5.0
     - name: db-config-secret
       value: easi-odc-v2-user-db
+    - name: s3-work
+      value: s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/work
     - name: s3-dest
-      value: s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/maps/chile_30m_2000_2026
+      value: s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/outputs/maps/chile_30m_2000_2026
     - name: s3-assets
       value: s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/assets
     - name: s3-mapbiomas
@@ -224,7 +226,9 @@ spec:
       source: |
         set -eux
         echo "biodiv-map-inference {{workflow.name}}" > /tmp/preflight.txt
-        aws s3 cp /tmp/preflight.txt "{{workflow.parameters.s3-dest}}/_preflight/{{workflow.name}}.txt"
+        aws s3 cp /tmp/preflight.txt "{{workflow.parameters.s3-work}}/runs/{{workflow.name}}/preflight.txt"
+        aws s3 cp /tmp/preflight.txt "{{workflow.parameters.s3-dest}}/.preflight-{{workflow.name}}"
+        aws s3 rm "{{workflow.parameters.s3-dest}}/.preflight-{{workflow.name}}"
         aws s3 ls "{{workflow.parameters.s3-assets}}/tiles/{{workflow.parameters.tiles-csv-name}}"
   - container:
       args:
@@ -311,7 +315,7 @@ spec:
       s3:
         bucket: easido-prod-dc-data-projects
         endpoint: s3.amazonaws.com
-        key: easi-workflows-team/biodiv/argo-artifacts/{{workflow.name}}/{{pod.name}}
+        key: easi-workflows-team/biodiv/work/runs/{{workflow.name}}/logs/{{pod.name}}
   - container:
       args:
       - |
@@ -373,7 +377,7 @@ spec:
       s3:
         bucket: easido-prod-dc-data-projects
         endpoint: s3.amazonaws.com
-        key: easi-workflows-team/biodiv/argo-artifacts/{{workflow.name}}/{{pod.name}}
+        key: easi-workflows-team/biodiv/work/runs/{{workflow.name}}/logs/{{pod.name}}
   - activeDeadlineSeconds: '{{workflow.parameters.chunk-deadline-seconds}}'
     container:
       args:
@@ -406,7 +410,7 @@ spec:
         # Uploaded whether or not the run above succeeded: a failed chunk is
         # exactly when the manifest's error rows are worth having.
         python scripts/argo/upload_run_evidence.py /work/out \
-          "{{workflow.parameters.s3-dest}}/_runs/{{workflow.name}}/chunk-{{inputs.parameters.chunk-id}}" \
+          "{{workflow.parameters.s3-work}}/runs/{{workflow.name}}/infer/chunk-{{inputs.parameters.chunk-id}}" \
           || echo "WARNING: run evidence was not uploaded" >&2
         exit $rc
       command:
@@ -527,10 +531,10 @@ spec:
       s3:
         bucket: easido-prod-dc-data-projects
         endpoint: s3.amazonaws.com
-        key: easi-workflows-team/biodiv/argo-artifacts/{{workflow.name}}/{{pod.name}}
+        key: easi-workflows-team/biodiv/work/runs/{{workflow.name}}/logs/{{pod.name}}
   # artifactGC is OnWorkflowDeletion, so this is also the window in which
   # `argo cp ... --artifact-name run-evidence` still works. 240 s was not
-  # enough to open a finished run; the S3 copy under _runs/ survives either
+  # enough to open a finished run; the S3 copy under work/runs/ survives either
   # way, this only governs the Argo-side copy.
   ttlStrategy:
     secondsAfterSuccess: 86400

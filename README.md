@@ -101,7 +101,7 @@ export BIODIV_ASSETS=s3://<bucket>/<prefix>/assets
 export BIODIV_MAPBIOMAS_DIR=s3://<bucket>/<prefix>/MapBiomas   # optional, same default
 
 python scripts/73_map_inference.py --tiles-file <tiles.csv> --years 2000-2026 \
-    --area-m2 900 --dest s3://<bucket>/<prefix>/maps --resume
+    --area-m2 900 --dest s3://<bucket>/<prefix>/outputs/maps --resume
 ```
 
 Point both variables at local directories instead and nothing else changes. `scripts/74`

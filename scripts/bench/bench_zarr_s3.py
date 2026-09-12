@@ -21,11 +21,11 @@ overlap, so whether splitting it pays is a question only S3 can answer.
 Usage:
     # stage the fixtures (one-off)
     PYTHONPATH=src python scripts/bench/bench_zarr_s3.py upload \
-        --from /home/jovyan/biodiv_cube_tiles --to s3://BUCKET/PREFIX/cube_bench
+        --from /home/jovyan/biodiv_cube_tiles --to s3://BUCKET/PREFIX/work/scratch/cube_bench
 
     # measure
     PYTHONPATH=src python scripts/bench/bench_zarr_s3.py read \
-        --root s3://BUCKET/PREFIX/cube_bench --mode direct --jobs 1
+        --root s3://BUCKET/PREFIX/work/scratch/cube_bench --mode direct --jobs 1
 """
 from __future__ import annotations
 

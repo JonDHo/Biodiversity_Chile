@@ -25,7 +25,7 @@ Usage:
         --workers 4 --out results/maps --tag pilot
     # full run: whole tiles on dask-gateway workers, GeoTIFFs to the scratch bucket
     python scripts/73_map_inference.py --tiles-file results/figures/tiles_native_10km.csv \\
-        --years 2000-2026 --gw-workers 32 --dest s3://BUCKET/PREFIX/maps/chile \\
+        --years 2000-2026 --gw-workers 32 --dest s3://BUCKET/PREFIX/outputs/maps/chile \\
         --mapbiomas-dir s3://BUCKET/PREFIX/MapBiomas --resume
 
 Requires BIODIV_UNIFIED=1 and BIODIV_CURVES=_raw100 only for ``--oof-csv``/range clipping

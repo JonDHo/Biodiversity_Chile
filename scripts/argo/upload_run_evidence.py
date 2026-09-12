@@ -10,7 +10,7 @@ without this copy they die with the pod and a finished run can only be
 audited from the tags baked into each raster.
 
 Usage:
-    python upload_run_evidence.py /work/out s3://bucket/prefix/_runs/<workflow>/chunk-0
+    python upload_run_evidence.py /work/out s3://bucket/prefix/work/runs/<workflow>/infer/chunk-0
 """
 from __future__ import annotations
 
