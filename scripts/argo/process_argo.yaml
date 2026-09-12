@@ -128,7 +128,7 @@ metadata:
 spec:
   arguments:
     parameters:
-    - name: base-image
+    - name: torch-cpu-image
       value: 444488357543.dkr.ecr.us-west-2.amazonaws.com/easi-workflows-base-torch-cpu:develop.latest
     - name: aws-image
       value: amazon/aws-cli:2.17.62
@@ -248,7 +248,7 @@ spec:
       # imports the package (scripts/argo/check_scaler.py).
       - name: PYTHONPATH
         value: /git/repo/src
-      image: '{{workflow.parameters.base-image}}'
+      image: '{{workflow.parameters.torch-cpu-image}}'
       name: ''
       resources:
         limits:
@@ -343,7 +343,7 @@ spec:
       env:
       - name: NUM_CHUNKS
         value: '{{workflow.parameters.num-chunks}}'
-      image: '{{workflow.parameters.base-image}}'
+      image: '{{workflow.parameters.torch-cpu-image}}'
       name: ''
       resources:
         limits:
@@ -448,7 +448,7 @@ spec:
       # usgs-landsat, not s3:ListBucket.
       - name: GDAL_DISABLE_READDIR_ON_OPEN
         value: EMPTY_DIR
-      image: '{{workflow.parameters.base-image}}'
+      image: '{{workflow.parameters.torch-cpu-image}}'
       name: ''
       resources:
         limits:

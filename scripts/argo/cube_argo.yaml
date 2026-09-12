@@ -93,18 +93,18 @@ spec:
   arguments:
     parameters:
     # Only build-batch needs this one. `import biodiv.maptask` pulls torch in through
-    # mapinfer -- verified, not assumed -- so the build pod cannot use the light image even
+    # mapinfer -- verified, not assumed -- so the build pod cannot use the base image even
     # though the build itself never runs a model. Making mapinfer's torch import lazy would
     # free it, which is worth considering if spot churn makes pod startup matter: the build
     # pass is meant for the cheapest capacity going, and that is the capacity that restarts.
-    - name: base-image
+    - name: torch-cpu-image
       value: 444488357543.dkr.ecr.us-west-2.amazonaws.com/easi-workflows-base-torch-cpu:develop.latest
     # The list and split steps need boto3 and the standard library, nothing else: they read
     # and write CSVs and call S3. cube_progress.py deliberately does not import `biodiv` at
     # all (it repeats the store-name convention instead), which is what lets them run here.
     # UNVERIFIED name, but cheap to get wrong -- these steps fail within seconds of the
     # submit, unlike the GPU image, which is why that one gets a preflight and this does not.
-    - name: light-image
+    - name: base-image
       value: 444488357543.dkr.ecr.us-west-2.amazonaws.com/easi-workflows-base:develop.latest
     # The GPU image is composed from cuda-tag rather than written out, because the CUDA
     # version is the only part anyone needs to change and it is the part nobody can guess.
@@ -627,7 +627,7 @@ spec:
 
   - name: list-to-build
     container:
-      image: '{{workflow.parameters.light-image}}'
+      image: '{{workflow.parameters.base-image}}'
       command: [bash, -c]
       args:
       - |
@@ -686,7 +686,7 @@ spec:
 
   - name: list-missing-maps
     container:
-      image: '{{workflow.parameters.light-image}}'
+      image: '{{workflow.parameters.base-image}}'
       command: [bash, -c]
       args:
       - |
@@ -751,7 +751,7 @@ spec:
       - name: missing-csv
         path: /work/missing_tiles.csv
     container:
-      image: '{{workflow.parameters.light-image}}'
+      image: '{{workflow.parameters.base-image}}'
       command: [python, -c]
       args:
       - |
@@ -806,7 +806,7 @@ spec:
       parameters:
       - name: batch-id
     container:
-      image: '{{workflow.parameters.base-image}}'
+      image: '{{workflow.parameters.torch-cpu-image}}'
       command: [bash, -c]
       workingDir: /git/repo
       args:
